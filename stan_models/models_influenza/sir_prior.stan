@@ -25,7 +25,7 @@ data {
   real t0;
   real ts[n_days];
   int N;
-  int cases[n_days];
+  //int cases[n_days];
 }
 
 transformed data {
@@ -56,8 +56,6 @@ transformed parameters{
 model {
   beta ~ normal(2, 1);
   gamma ~ normal(0.4, 0.5);
-  
-  //col(matrix x, int n) - The n-th column of matrix x
   phi_inv ~ exponential(5);
 
 }
@@ -66,5 +64,7 @@ generated quantities {
   real R0 = beta/gamma;
   real recovery_time = 1/gamma;
   real pred_cases[n_days];
+  
+  //col(matrix x, int n) - The n-th column of matrix x
   pred_cases = neg_binomial_2_rng(col(to_matrix(y),2) + 1e-5, phi);
 }
