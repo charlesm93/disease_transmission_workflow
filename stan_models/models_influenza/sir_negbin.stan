@@ -52,13 +52,14 @@ model {
   phi_inv ~ exponential(5);
   
   //sampling distribution
-  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
   cases ~ neg_binomial_2(col(to_matrix(y), 2), phi);
 }
 generated quantities {
   real R0 = beta / gamma;
   real recovery_time = 1 / gamma;
   real pred_cases[n_days];
+  
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
   pred_cases = neg_binomial_2_rng(col(to_matrix(y), 2), phi);
 }
 
