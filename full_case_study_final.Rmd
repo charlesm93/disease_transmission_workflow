@@ -1,0 +1,2040 @@
+---
+title: "Bayesian workflow for disease transmission modeling in Stan"
+author: "Léo Grinsztajn^[École polytechnique, Palaiseau, France, leo.grinsztajn@polytechnique.edu], Elizaveta Semenova^[Data Sciences and Quantitative Biology, Discovery Sciences, R&D, AstraZeneca, Cambridge, UK], Charles C. Margossian^[Department of Statistics, Columbia University, New York, NY, USA], Julien Riou^[Institute of Social and Preventive Medicine, University of Bern, Bern, Switzerland]"
+link-citations: true
+output:
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+bibliography: biblio.bib
+biblio-style: imsmart-nameyear
+abstract: This tutorial shows how to build, fit, and criticize disease transmission models in Stan, and should be useful to researchers interested in modeling the COVID-19 outbreak and doing Bayesian inference. Bayesian modeling provides a principled way to quantify uncertainty and incorporate prior knowledge into the model. What is more, Stan's main inference engine, Hamiltonian Monte Carlo sampling, is amiable to diagnostics, which means we can verify whether our inference is reliable. Stan is an expressive probabilistic programing language that abstracts the inference and allows users to focus on the modeling. The resulting code is readable and easily extensible, which makes the modeler's work more transparent and flexible. In this tutorial, we demonstrate with a simple Susceptible-Infected-Recovered (SIR) model how to formulate, fit, and diagnose a compartmental model in Stan. We also introduce more advanced topics which can help practitioners fit sophisticated models; notably, how to use simulations to probe our model and our priors, and computational techniques to scale ODE-based models.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# color palette
+c_light <- c("#fee0d2")
+c_mid <- c("#fc9272")
+c_dark <- c("#de2d26")
+c_simu <- "chartreuse3"
+c_posterior = "orange"
+c_prior = "aquamarine2"
+
+set.seed(1) # for reproductibility
+```
+
+# Introduction
+
+The ongoing pandemic of the Coronavirus COVID-19 has led to an increased interest 
+in statistical disease modeling
+and, amongst other approaches, Bayesian modeling
+(e.g @Flaxman_covid_2020; @Riou_covid_2020;
+see this [post on the Stan forum](https://discourse.mc-stan.org/t/stan-being-used-to-study-and-fight-coronavirus/14296) for an updated list of examples).
+
+
+Transmission models of infectious diseases can help answer questions about past and future transmission,
+including the effects of interventions. 
+<!-- Such models can be expressed in several ways. -->
+<!-- The two broad categories are population-based and agent-based models.  -->
+_Population-based models_ subdivide the total population into homogeneous groups,
+called _compartments_.
+The flows between compartments can be described by a system of differential equations.
+Individuals within a compartment are considered to be in the same state
+(e.g. susceptible, infected, etc.).
+Moreover, the time-dependent volume of each compartment
+solves a system of ordinary differential equations (ODEs).
+Compartment models are relatively easy to formulate
+and computationally tractable.
+<!-- Agent-based models simulate inidivuals (called _agents_) -->
+<!-- and their interaction with an environment over time. -->
+<!-- This approach explicitly accounts for heterogeneity amongst individuals -->
+<!-- but yields models which are difficult to handle, -->
+<!-- both mathematically and computationally. -->
+<!-- By contrast, compartment models are relatively easy to formulate -->
+<!-- and computationally tractable. -->
+
+<!-- and model the size of each compartment via a set of either continuous or discrete-time differential equations. -->
+<!-- Individuals within each compartment are considered to have the same state with respect to the disease in question.  -->
+<!-- Time-dependent number of individuals in each group is a solution of an ordinary differential equations system relating all the quantities. Stochastic processes, such as Markov chains, are also used to describe transitions between compartments. Agent-based models are used to simulate individuals (agents) and their interactions with an environment over time. Such models allow to account for heterogeneity in an explicit way but are very computationally demanding, especially when the objective is statistical inference.]. -->
+<!-- Compartmental models described by ordinary differential equations (ODEs) have gained popularity due to several factors:  -->
+<!-- they are relatively easy to formulate, are computationally more tractable than agent-based models,  -->
+<!-- and in the simplest cases can be solved and/or analysed analytically.  -->
+<!-- In practice, the volumes of some compartments and most parameters driving the dynamic are latent, -->
+<!-- and thus need to be inferred.  -->
+<!-- Statistical inference for ODEs is a hard task and should be treated separately from the model formulation. -->
+
+<!-- The ongoing pandemic of the Coronavirus COVID-19 has led to an increased interest in statistical disease modeling. Indeed, transmission models of infectious diseases can help answer questions about forecasting and effects of interventions. Such models can be expressed in several ways^[The three broad categories are population-based, agent-based or stochastic models. Population-based models subdivide the total population into homogeneous groups (compartments) and model the volume of each group via a set of continuous-time differential equations or discrete-time difference equations. Individuals within each compartment are considered to have the same state with respect to the disease in question. Time-dependent number of individuals in each group is a solution of an ordinary differential equations (ODEs) system relating all the quantities. Agent-based models are used to simulate individuals (agents) and their interactions with an environment over time. Such models allow to account for heterogeneity in an explicit way but are very computationally demanding. Stochastic processes, such as Markov chains, are also used to describe transitions between compartments.]. Compartmental models described by ODEs have gained popularity due to several factors: they are relatively easy to formulate, require less computational time than agent-based models, and in the simplest case can be solved and/or analysed analytically. However in practice, the volumes of some compartments and most parameters driving the dynamic are latent, and thus need to be inferred. Statistical inference for ODEs is a hard task and should be treated separately from the model formulation. -->
+
+In this tutorial, we demonstrate with a simple example how
+to formulate and fit a typical compartmental model in Stan. 
+Stan is a probabilistic programming framework designed to let the user focus on modeling, while inference happens under the hood [@Carpenter_stan_2017]. This allows for faster implementation and extension of epidemiological models through a principled modeling workflow, and is thus particularly useful when handling rapidly evolving data and knowledge.
+Stan is an expressive language that supports many probability densities, matrix operations, and numerical ODE solvers. 
+We can combine all these elements to specify a data generating process. 
+We can also compute useful epidemiological parameters,
+such as the _basic reproduction number_, $R_0$, and make predictions.
+
+<!-- $R_0$ is defined as the expected number of secondary infections produced from one infected individual in a fully susceptible population through the entire duration of the infectious period. -->
+<!-- $R_0 > 1$ indicates a sustainable infection, -->
+<!-- which can lead to a major outbreak, -->
+<!-- while $R_0 < 1$ suggests, under stable conditions, that the infection will die out. -->
+<!-- ^[Two crucial numbers quantifying a disease are the *basic reproduction number* $R_0$ and the *effective reproduction number* $R_t.$ The basic reproduction number, $R_0$, is the expected number of secondary infections produced from one infected individual in a fully susceptible population through the entire duration of the infectious period. Values of $R_0$ greater than one indicate a sustainable infection, when a major outbreak to be foreseen, while values below one indicate, under stable conditions, a potentially small outbreak and that the infection will die out.]. -->
+
+Generative models formulated in Stan can be used both for simulation and inference.
+Stan bolsters several inference methods: full Bayesian inference using Markov chains Monte Carlo (MCMC), approximate Bayesian inference with variational inference, and penalized maximum likelihood estimation. We focus on Bayesian inference with MCMC. 
+Bayesian inference gives us a principled quantification of uncertainty and the ability to incorporate domain knowledge in the form of priors, while MCMC is a reliable and flexible algorithm. 
+In addition, Stan provides diagnostic tools to evaluate both the inference (e.g. accuracy of the MCMC, convergence of chains) and the model (e.g. posterior predictive checks).
+
+Other tutorials on the subject include the work by @Chatzilena_tutorial_2019
+and @Mihaljevic_tutorial_2016 on transmission models,
+and the case studies by @Carpenter_predatory-prey_2018, @Weber_ode_2018,
+and @margossian_differential_2017 on ODE-based models,
+all of which can serve as complementary reading.
+
+
+
+## Outline
+
+Through the lens of the Susceptible-Infected-Recovered (SIR) model, we show how to put together a principled Bayesian workflow in Stan, allowing a faster development of reliable epidemiological models.
+In Section 1, we introduce how to build, fit, and diagnose compartment models in Stan.
+The next sections discuss topics that can help practitioners fit more complex models.
+Section 2 reviews how we can use simulated data to examine our model and our priors,
+and provides an introduction to inference calibration.
+Section 3 offers a pragmatic discussion on how to efficiently implement
+and scale up ODEs in Stan.
+Throughout the tutorial, we use R as a scripting language^[Note that Stan can also be used with other langages such as Python or Julia, see [here](https://mc-stan.org/users/interfaces/) for the list of Stan interfaces],
+and, while we review some elementary concepts,
+assume the reader has basic familiarity with Bayesian inference
+and Stan. The source code of this case study can be found on Github [here](https://github.com/stan-dev/example-models/tree/master/knitr/disease_transmission).
+
+
+# 1 Simple SIR 
+
+## Data
+
+In this example, we examine an outbreak of influenza A (H1N1) in 1978 at a British boarding school. 
+The data consists of the daily number of students in bed, spanning over a time interval of 14 days. 
+There were 763 male students who were mostly full boarders and 512 of them became ill. 
+The outbreak lasted from the 22nd of January to the 4th of February. 
+It is reported that one infected boy started the epidemic, which spread rapidly in the relatively closed community of the boarding school. 
+<!-- The original data were available only in a figure with some additional data in the [main text](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1603269/pdf/brmedj00115-0064.pdf).  -->
+The data are freely available in the R package outbreaks, maintained as part of the [R Epidemics Consortium](http://www.repidemicsconsortium.org).
+
+
+```{r, message=FALSE}
+library(outbreaks)
+library(tidyverse)
+```
+
+```{r}
+head(influenza_england_1978_school)
+```
+
+```{r}
+theme_set(theme_bw())
+ggplot(data = influenza_england_1978_school) + 
+  geom_point(mapping = aes(x = date, y = in_bed)) + 
+  labs(y = "Number of students in bed")
+```
+
+
+## Mathematical transmission model
+The Susceptible-Infected-Recovered (SIR) model splits the population in three time-dependent compartments: the susceptible, the infected (and infectious), and the recovered (and not infectious) compartments. When a susceptible individual comes into contact with an infectious individual, the former can become infected for some time, and then recover and become immune.
+The dynamics can be summarized graphically:
+
+<img src="pictures/SIR_tikz.png" alt="SIR graph" width="500" align="center"/>
+
+
+The temporal dynamics of the sizes of each of the compartments are governed by the following  system of ODEs:
+
+$$
+\begin{aligned}
+ \frac{dS}{dt} &= -\beta  S \frac{I}{N}\\
+ \frac{dI}{dt} &= \beta  S  \frac{I}{N} - \gamma  I \\
+ \frac{dR}{dt} &= \gamma I
+\end{aligned}
+$$
+where
+
+* $S(t)$ is the number of people susceptible to becoming infected (no immunity),
+
+* $I(t)$ is the number of people currently infected (and infectious),
+
+* $R(t)$ is the number of recovered people (we assume they remain immune indefinitely),
+
+* $\beta$ is the constant rate of infectious contact between people,
+
+* $\gamma$ the constant recovery rate of infected individuals.
+
+
+Let's give some intuition behind these ODEs. The proportion of infected people among the population is $\frac{I}{N}$. At each time step, given uniform contacts, the probability for a susceptible person to become infected is thus $\beta\frac{I}{N}$, with $\beta$ the average number of contacts per person per time, multiplied by the probability of disease transmission when a susceptible and an infected subject come in contact. Hence, at each time step, $\beta  S \frac{I}{N}$ susceptible individuals become infected,  meaning $\beta  S \frac{I}{N}$ people leave the $S$ compartment and $\beta  S \frac{I}{N}$ people enter the $I$ compartment. Similarly, the recovery of an infected individual is taking place at rate $\gamma$, and thus the number of infected individuals decreases with speed $\gamma I$ while the number of recovered grows at the same speed.
+
+
+The above model holds under several assumptions: 
+
+* births and deaths are not contributing to the dynamics and the total population $N=S+I+R$ remains constant, 
+* recovered individuals do not become susceptible again over time,
+
+* the infection rate $\beta$ and recovery rate $\gamma$ are constant, 
+
+* the population is homogeneous, 
+
+* individuals meet any other individual uniformly at random (homogeneous mixing)
+and recovery time follows an exponential distribution with mean $\frac{1}{\gamma}$.
+
+* replacing the integer number of people in each compartement by a continuous approximation is legitimate (the population is big enough)
+
+In case of boarding school data, the spread of the disease has started with one infected individual which leads to the initial conditions $I(0) = 1, S(0) = N-1, R(0) = 0.$
+
+
+
+## Statistical model
+
+We now introduce a _sampling distribution_ (also termed _likelihood_)
+$$ 
+  p(\mathcal Y \mid \theta) 
+$$
+which tells us, given model parameters $\theta$, how to generate data $\mathcal Y$.
+Inference reverse-engineers the data generating process
+and asks: "given a model and observations, $\mathcal Y$,
+what are plausible parameter values?"
+In a Bayesian framework, the set of plausible values is characterized by
+the _posterior distribution_, 
+$$
+p(\theta \mid \mathcal Y).
+$$
+Bayes' rule teaches us that
+$$
+  p(\theta \mid \mathcal Y) \propto p(\mathcal Y \mid \theta) p(\theta)
+$$
+where $p(\mathcal Y \mid \theta)$ is the sampling distribution,
+$p(\theta)$ the _prior_ distribution,
+and $\propto$ stands for "proportional to".
+The prior encodes information about the parameters we have
+before observing the data.
+To summarize, a Bayesian model couples a mathematical model of what we know about the parameters in the form of a prior and a sampling distribution, i.e. a model of the data generating process.
+
+<!-- ^[Given the a priori probability of the parameters $p(\theta)$ and the probability of the data given the parameters $p(y|\theta)$, Bayes rules tells us that the posterior distribution of the parameters $\theta$ is $p(\theta|y) \propto p(\theta)p(y|\theta)$]. Specifically, a Bayesian model requires a mathematical model of what we know about the parameters (i.e., a prior) and a model of what we know about the data generating process given the parameters (i.e., a sampling distribution). -->
+
+### Sampling distribution
+<!-- Here we build a compatemental model.  -->
+Given transmission parameters and initial conditions, 
+a compartmental model defines a unique solution for each of the compartments, 
+including the number of infected students, $I_\text{ODE}(t)$. 
+We want to link this solution to the observed data, i.e the number of students in bed, $I_\text{obs}(t)$, at each time point.
+<!-- (other states and parameters are latent).  -->
+The latter is a noisy estimate of the true number of infected students.
+<!-- Likelihood allows us to match observed and predicted values to update the latent parameters. -->
+We choose to model the number of students in bed with a count distribution -- 
+the Negative Binomial. 
+This distribution allows us to use $I_\text{ODE}(t)$ as the expected value
+and account for over-dispersion, through the parameter $\phi$:
+
+$$
+I_\text{obs}(t) \sim \text{NegBin}(I_\text{ODE}(t), \phi)
+$$
+This gives us $p(\mathcal Y \mid \theta)$, with $\theta = (\beta, \gamma, \phi)$, the parameters of the model.
+
+
+### Prior distribution
+We still need $p(\theta)$. With $\theta = (\beta, \gamma, \phi)$, we specify a prior distribution for each of the three parameters. One advantage of the Bayesian approach is that we can formally
+incorporate prior knowledge about the parameters into the model.
+<!-- prior knowledge about the parameters can be formally incoperated into the model. -->
+<!-- Natural constraints on both $\beta$ and $\gamma$ are that they are positive.  -->
+<!-- Knowledge about the contact rate, infectiousness and recovery rate can be expressed in the form of priors. -->
+For instance, we specify $\gamma \sim N(0.4, 0.5)$ (truncated at 0), which expresses our belief that $\gamma$ has to be positive, and that $P(\gamma \leq 1) = 0.9$ 
+(i.e the probability that the recovery time is > 1 day is 0.9 *a priori*). 
+We can change this prior if more information becomes available, constraining our parameter estimation more tightly or, on the contrary,
+increasing its variance.
+
+Section 2 discusses how to check if our priors are consistent with available domain knowledge using _prior predictive checks_.
+
+### Predictions and derived quantities
+
+Once we fit the model and obtain a posterior distribution for $\theta$,
+we can derive additional quantities of interests.
+We can simulate predictions, $\mathcal Y_\mathrm{pred}$,
+and work out the plausible range of new observations.
+Because these predictions are based on the posterior, $p(\theta \mid \mathcal Y)$,
+our simulations account for uncertainty both in the data generating process
+and in our estimates of $\theta$.
+Moreover, we compute a posterior distribution of predictions
+$$
+  p(\mathcal Y_\mathrm{pred} \mid \mathcal Y) = \int p(\mathcal Y_{pred} | \theta) p(\theta | \mathcal Y) d\theta
+$$
+
+Similarly we can compute quantities that depend on the model parameters.
+An important example is the basic reproduction number, $R_0$.
+$R_0$ is defined as the expected number of secondary infections produced from one infected individual in a fully susceptible population through the entire duration of the infectious period.
+$R_0 > 1$ indicates a sustainable infection,
+which can lead to a major outbreak, while $R_0 < 1$ suggests, under stable conditions, that the infection will die out.
+Bayesian inference allows us to construct a posterior distribution for this quantity too
+$$
+  p(R_0 \mid \mathcal Y).
+$$
+
+
+## Coding the Model: Stan Program
+
+We will need the following libraries
+```{r, message=FALSE}
+library(rstan)
+library(gridExtra)
+rstan_options (auto_write = TRUE)
+options (mc.cores = parallel::detectCores ())
+```
+
+### Coding the ODE in Stan
+
+An ODE takes the form
+$$
+  \frac{\mathrm d y}{\mathrm d t} = f(t, y)
+$$
+where $y$ are the _states_, in our example $y = (S, I, R)$,
+and $t$ is time.
+We also need an initial condition $y_0$ at $t_0$
+and the times, $\tau$, at which we evaluate the solution.
+
+To specify an ODE in Stan, we first code $f$ in the `functions` block.
+This function must observe a strict signature:
+```{stan, eval=F, output.var="md"}
+real[] f(real time, real[] state, real[] theta,
+         real[] x_r, int[] x_i)
+```
+with
+
+* `time`, $t$;
+
+* `state`, the volumes in each compartment, $y$;
+
+* `theta`, variables used to compute $f$, which depend on the model parameters;
+
+* `x_r`, real variables used to evaluate $f$, which only depend on fixed data;
+
+* `x_i`, integer values used to evaluate $f$, which only depend on fixed data.
+
+We motivate this signature in our discussion on scaling ODEs (section 3).
+
+In our example, the ODEs for the SIR model is defined as follows:
+```{stan, eval=F, output.var="md"}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real S = y[1];
+      real I = y[2];
+      real R = y[3];
+      real N = x_i[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      
+      real dS_dt = -beta * I * S / N;
+      real dI_dt =  beta * I * S / N - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dI_dt, dR_dt};
+  }
+}
+```
+
+We evaluate the solution numerically by using one of Stan's numerical integrators.
+We opt for the Runge-Kutta 4$^\mathrm{th}$ / 5$^\mathrm{th}$ order
+but, as we discuss in section 3, the user can consider other options.
+A call to the integrator looks as follows
+```{stan, eval=F, output.var="md"}
+  y = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i);
+```
+with
+
+* `sir`, the name of the function that returns the derivatives, $f$;
+
+* `y0`, the initial condition;
+
+* `t0`, the time of the initial condition;
+
+* `ts`, the times at which we require the solution to be evaluated;
+
+* `theta`, `x_r`, `x_i`, arguments to be passed to $f$.
+
+We now have all the ingredients to solve our ODE.
+
+Note that in the given example, when we assume that the total population remains constant, the three derivatives $\frac{dS}{dt}$, $\frac{dI}{dt}$, $\frac{dR}{dt}$ sum up to $0$:  We can use this fact to improve computational efficiency of the `sir` function by deriving the value of $\frac{dI}{dt}$ from $\frac{dS}{dt}$ and $\frac{dR}{dt}$:
+```{stan, eval=F, output.var="md"}
+      real dS_dt = -beta * I * S / N;
+      real dR_dt =  gamma * I;
+      real dI_dt =  -(dS_dt + dR_dt);
+```
+
+
+### Building the model in Stan
+
+We next code the model in Stan, working through the various coding blocks.
+The `functions` block specifies `sir`
+```{stan, eval=F, output.var="md"}
+functions {
+  real[] sir (...) {...} //copy code from above
+}
+```
+
+
+Fixed data is declared in the `data` block:
+```{stan, eval=F, output.var="md"}
+data {
+  int<lower=1> n_days;
+  real y0[3];
+  real t0;
+  real ts[n_days];
+  int N;
+  int cases[n_days];
+}
+
+```
+We code transforms of the data in the `transformed data` block. In this example, we transform our data  to match the signature of `sir` (with `x_r` being of length 0 because we have nothing to put in it).
+```{stan, eval=F, output.var="md"}
+transformed data {
+  real x_r[0];
+  int x_i[1] = { N };
+}
+
+```
+
+We next declare the model parameters. If you want some parameter to be bounded, and it is not already guaranteed by his prior, you need to specify `<lower=a, upper=b>` when declaring this parameter. Note that this is how you put a truncated prior distribution on a parameter.
+```{stan, eval=F, output.var="md"}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> phi_inv;
+}
+```
+
+And then transforms of the parameters
+```{stan, eval=F, output.var="md"}
+transformed parameters{
+  real y[n_days, 3];
+  real phi = 1. / phi_inv;
+  {
+    real theta[2];
+    theta[1] = beta;
+    theta[2] = gamma;
+
+    y = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i);
+  }
+}
+```
+
+With the ODE solution, $y$, in hand, the only thing left to do is to code the prior and sampling distribution. 
+<!-- As with the other parts of the model, these directly follow the notation in the mathematical specification. -->
+```{stan, eval=F, output.var="md"}
+model {
+  //priors
+  beta ~ normal(2, 1); //truncated at 0
+  gamma ~ normal(0.4, 0.5); //truncated at 0
+  phi_inv ~ exponential(5);
+  
+  //sampling distribution
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people
+  cases ~ neg_binomial_2(col(to_matrix(y), 2), phi);
+}
+
+```
+
+Untangled from the inference, we can calculate the basic reproduction number, $R_0$, and predictions for the number of cases in the `generated quantities` block:
+```{stan, eval=F, output.var="md"}
+generated quantities {
+  real R0 = beta / gamma;
+  real recovery_time = 1 / gamma;
+  real pred_cases[n_days];
+  pred_cases = neg_binomial_2_rng(col(to_matrix(y), 2) + 1e-5, phi);
+}
+```
+
+
+<!-- ### Pressing the inference button -->
+### Fitting the model in R
+
+<!-- To provide the data to Stan for inference -->
+<!-- ^[What do we mean by inference here? We want to infer the value of the parameters $\theta$ given the data $y$ . We have already specified the priors $p(\theta)$ and the likelihood $p(y|\theta)$. Bayes rules tells us that the posterior distribution of the parameters $\theta$ is $p(\theta|y) \propto p(\theta)p(y|\theta)$. We thus know this distribution $p(\theta|y)$ up to a multiplicative constant. Stan provides a version of Markov Chain Monte Carlo (MCMC), which provides samples which approximativelly follow the $p(\theta|y)$ distribution. By approximating the true posterior distribution by the empirical distribution on these samples, we can compute the expectations of functions of the paramaters, or e.g the probability that the number of infected student is more than 10 on the third day.],  -->
+<!-- we collect it into a list -->
+We now go to R and collect the data into a list.
+```{r}
+# time series of cases
+cases <- influenza_england_1978_school$in_bed  # Number of students in bed
+
+# total count
+N <- 763;
+
+# times
+n_days <- length(cases) 
+t <- seq(0, n_days, by = 1)
+t0 = 0 
+t <- t[-1]
+
+#initial conditions
+i0 <- 1
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+
+# data for Stan
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cases)
+
+# number of MCMC steps
+niter <- 2000
+
+```
+
+Next we compile the model, saved in the file `sir_negbin.stan`,
+
+```{r}
+model <- stan_model("stan_models/models_influenza/sir_negbin.stan")
+```
+
+and run MCMC.
+For this problem, it suffices to use Stan's defaults.
+Note that, as is standard practice, we run 4 Markov chains.
+```{r}
+fit_sir_negbin <- sampling(model,
+                data = data_sir,
+                iter = niter,
+                chains = 4, 
+                seed = 0)
+```
+
+### Checking the inference
+
+Let's specify the parameters of interest.
+```{r}
+pars=c('beta', 'gamma', "R0", "recovery_time")
+```
+<!-- We here display the median (0.5 quantile) and 90% interval (0.05 and 0.95 quantiles), restricted to the parameters of interest. -->
+
+We start with a summary table of the results,
+which displays the posterior mean, standard error, quantiles,
+and some useful diagnostics.
+```{r}
+print(fit_sir_negbin, pars = pars)
+```
+
+Stan gives us a host of information to evaluate whether the inference is reliable. During sampling, warnings can tell us if something is wrong (here we have no warnings^[Note that getting a few warnings is not always concerning, especially if they only occur during
+the warmup phase. See [here](https://mc-stan.org/misc/warnings.html) for an overview of Stan's warnings]). In the summary table, several quantities are available to check inference. Here we note that $\widehat R$ is close to 1 (< 1.01),
+indicating the 4 Markov chains are in close agreement with one another.
+Furthermore the effective samples size, $n_\mathrm{eff}$, is large (> 100^[$n_\mathrm{eff} \geq 100$ is considered sufficient to estimate the posterior mean correctly. Note that we may need a bigger $n_\mathrm{eff}$ to estimate extreme quantiles.]),
+which means the Markov chains were able to cohesively explore the parameter space.
+Conversely, large $\widehat R$ and low $n_\mathrm{eff}$ would indicate that the Markov chains
+are poorly mixing. Apart from fixing coding errors, improving the mixing of the Markov chains almost always requires tweaking the model specification, for example with a [reparameterization](https://mc-stan.org/docs/2_23/stan-users-guide/reparameterization-section.html) or stronger priors.
+
+<!-- There were no divergent transitions reported^[Divergences occur when Stan’s Hamiltonian solver diverges from the true Hamiltonian, which must be conserved, because of numerical problems in the stepwise gradient-based approximation of the curvature of the log density. This indicates that the Markov chains did not completely explore the posterior and that our Markov chain Monte Carlo estimators will be biased. This is often the sign that some region of the posterior is hard to explore and that the step-size strongly depends on the location. Divergences, however, can sometimes be false positives. To verify that we have real fitting issues we can rerun with a larger target acceptance probability, adapt_delta, which will force more accurate simulations of Hamiltonian trajectories and reduce the false positives.] and more generally no warning messages.  -->
+<!-- $\hat{R}$ values^[$\hat{R}$ indicates how well different chains of the MCMC have mixed : if $\hat{R}$ is close to 1, it means that all the chains are exploring the same region, and thus that no chain should be stuck in one subregion. In practice, $\hat{R} \leq 1.01$ is satisfactory.] are close to 1 (<1.01), and the effective sample size^[The effective sample size corresponds to the number of independant posterior draws which would yield the same standard error of estimation for the **mean** of the parameters that the draws from Stan's MCMC. Note that $n_{eff}$ can be much lower for quantiles. In practice, $n_{eff} \geq 100$ for estimating the parameter mean is considered sufficient. With effective sample sizes of roughly one hundred, standard errors are roughly one tenth the size of posterior standard deviations, being in an inverse square root relation.] estimates for each parameter are sufficient (>100) for inference^[Both large $\hat{R}$ and low effective samples per transition would be consequences of poorly mixing Markov chains. Improving the mixing of the Markov chains almost always requires tweaking the model specification, for example with a reparameterization or stronger priors.]. -->
+
+We can furthermore plot the marginal posterior densities
+and confirm the Markov chains are in agreement with one another.
+```{r}
+stan_dens(fit_sir_negbin, pars = pars, separate_chains = TRUE)
+```
+
+
+### Checking the model
+
+Now that we trust our inference, let us check the utility of our model.
+Utility is problem specific and can include the
+precise estimation of a quantity or predicting future behaviors.
+In general, it is good to check if our model, once fitted, produces simulations
+that are consistent with the observed data.
+This is the idea behind _posterior predictive checks_.
+
+We sample predictions, $\mathcal Y_\mathrm{pred}$, 
+from $p(\mathcal Y_\mathrm{pred} \mid \mathcal Y)$
+and use these samples to construct a fitted curve for students in bed,
+together with the uncertainty (90% interval, 
+meaning observed data is expected to fall outside of this interval one in ten times). 
+This _posterior predictive check_ allows us to verify if the model captures the structure of the data. 
+Here we see that the model gives a satisfying fit to the data, 
+and that the model uncertainty is able to capture the variation of the data.
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(
+  fit_sir_negbin, pars = "pred_cases", probs = c(0.05, 0.5, 0.95))$summary), t, cases)
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = c_posterior, alpha = 0.35) +
+  geom_line(mapping = aes(x = t, y = X50.), color = c_posterior) + 
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Number of students in bed")
+```
+
+Maybe we also want to access the true number of infected people at each time, and not just the number of students in bed. This is a latent variable for which we have an estimation.
+```{r}
+params <- lapply(t, function(i){sprintf("y[%s,2]", i)}) #number of infected for each day
+smr_y <- as.data.frame(summary(fit_sir_negbin, 
+                               pars = params, probs = c(0.05, 0.5, 0.95))$summary)
+colnames(smr_y) <- make.names(colnames(smr_y)) # to remove % in the col names
+
+ggplot(smr_y, mapping = aes(x = t)) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = c_posterior, alpha = 0.35) +
+  geom_line(mapping = aes(x = t, y = X50.), color = c_posterior) + 
+  labs(x = "Day", y = "Number of infected students")
+
+```
+
+## Complete Stan program
+```{stan, eval=F, output.var="md"}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real S = y[1];
+      real I = y[2];
+      real R = y[3];
+      real N = x_i[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      
+      real dS_dt = -beta * I * S / N;
+      real dI_dt =  beta * I * S / N - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dI_dt, dR_dt};
+  }
+}
+data {
+  int<lower=1> n_days;
+  real y0[3];
+  real t0;
+  real ts[n_days];
+  int N;
+  int cases[n_days];
+}
+transformed data {
+  real x_r[0];
+  int x_i[1] = { N };
+}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> phi_inv;
+}
+transformed parameters{
+  real y[n_days, 3];
+  real phi = 1. / phi_inv;
+  {
+    real theta[2];
+    theta[1] = beta;
+    theta[2] = gamma;
+
+    y = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i);
+  }
+}
+model {
+  //priors
+  beta ~ normal(2, 1);
+  gamma ~ normal(0.4, 0.5);
+  phi_inv ~ exponential(5);
+  
+  //sampling distribution
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
+  cases ~ neg_binomial_2(col(to_matrix(y), 2), phi);
+}
+generated quantities {
+  real R0 = beta / gamma;
+  real recovery_time = 1 / gamma;
+  real pred_cases[n_days];
+  pred_cases = neg_binomial_2_rng(col(to_matrix(y), 2), phi);
+}
+```
+
+# 2 Using simulated data to understand our model
+
+We fitted a simple model to a well-understood data set.
+In practice, we must proceed more cautiously
+and probe the behavior of our model and our inference algorithm.
+To that end, working with fake data can be a very productive endeavour.
+
+## Checking our priors
+
+We can check if our priors are sound
+by computing the *a priori* probability of various epidemiological parameters of interest. 
+For instance for influenza, we know from domain knowledge that $R_0$ is typically between 1 and 2, 
+and that the recovery time is approximately 1 week. 
+We want priors that allow for every reasonable configurations of the data 
+but exclude pattently absurd scenarios, per our domain expertise. 
+To check if our priors fulfill this role, we can do a *prior predictive check*.
+<!-- i.e sample parameters of interest from the prior distribution. -->
+
+To conduct a prior predictive check, we take the same model as before, 
+put the parameters of interest in the `generated_quantities` code block, 
+and remove the sampling distribution term from the model. 
+Without the sampling distribution, the parameters are not fitted to the data 
+and are thus sampled from their prior distribution. 
+The Stan code is thus the same as the final Stan code, without the `cases ~ neg_binomial_2(col(to_matrix(y), 2), phi);` line. A useful trick to make prior predictive check easy is to add a switch `compute_likelihood` to the data. Then in the `model` code block :
+```{stan, eval=F, output.var="md"}
+if (compute_likelihood == 1)
+  cases ~ neg_binomial_2(col(to_matrix(y), 2), phi);
+```
+This allows to do prior predictive check and inference with the same Stan file.
+
+We compile the model without the likelihood term
+```{r}
+model_prior <- stan_model("stan_models/models_influenza/sir_prior.stan")
+```
+
+and sample from it.
+```{r}
+fit_sir_prior <- sampling(model_prior,
+                          data = data_sir, 
+                          chains = 4,
+                          seed = 0)
+```
+This gives us samples from the *a priori* distribution of parameters, which we can visualize.
+Here we show the distribution of the log of the recovery time, 
+with the red bars showing loose bounds on the recovery time (1/2 day and 30 days). 
+We observe that most of the probality mass is between the red bars
+but we still allow more extreme values,
+meaning our posterior can concentrate outside the bars, if the data warrants it.
+
+```{r}
+s_prior <- rstan::extract(fit_sir_prior)
+ggplot(tibble(r = s_prior$recovery_time)) + 
+  geom_density(aes(x = r),fill=c_prior, alpha = 0.6) + 
+  geom_vline(xintercept = c(0.5,30), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery time (days, log)",y="Probability density")
+```
+We can do the same thing for $R_0$ (again, on the log-scale), the loose bounds being 1 and 10.
+
+```{r}
+ggplot(tibble(r = s_prior$R0)) + 
+  geom_density(aes(x = r),fill=c_prior, alpha = 0.6) + 
+  geom_vline(xintercept = c(1,10), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number (log)",y="Probability density")
+```
+
+We thus see that these distributions are coherent with domain knowledge. See [here](https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations) for more recommendations on prior choice.
+
+We can also plot trajectories of infection according to the prior, 
+that is the number of infected people at each time accoring to prior distributions of parameters.
+```{r, warning=FALSE}
+n_draws <- 1000
+draws <- as_tibble(t(s_prior$y[,,2][1:n_draws,])) %>% add_column(t=t)
+draws <-  pivot_longer(draws, c(1:1000) , names_to = "draw")
+draws %>% 
+  ggplot() + 
+  geom_line(mapping = aes(x = t, y=value, group = draw), alpha = 0.6, size=0.1) +
+  geom_hline(yintercept=763, color="red")  +
+  geom_text(x=1.8, y=747, label="Population size", color="red") +
+  labs(x = "Day", y="Number of infected students")
+```
+
+And the median (black line) and 90% interval of the *a priori* number of student in bed (i.e the observed number of infected students).
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_sir_prior, pars="pred_cases", 
+                                        probs=c(0.05, 0.5, 0.95))$summary), t)
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping=aes(x=t)) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = c_prior, alpha = 0.35) +
+  geom_line(mapping=aes(x=t, y=X50.), color = c_prior) + 
+  geom_hline(yintercept=763, color="red" ) +
+  geom_text(x=1.8, y=747, label="Population size", color="red") +
+  labs(x = "Day", y="Number of students in bed")
+```
+
+It seems that most trajectories are reasonable and quite diverse. Still, some of the curves look a little bit funky and suggest we could refine our priors and make them more informative, although it may not be needed here. 
+
+Typically, we can get away with priors that do not capture all our *a priori* knowledge,
+provided the data is informative enough.
+However when dealing with complicated models and relatively sparse data, 
+we usually need well constructed priors to regularize our estimates and avoid non-identifiability.
+
+
+## Can our inference algorithm recover the right parameters?
+
+While there exist many theoretical guarantees for MCMC algorithms,
+modelers should realize that these rely on a set of assumptions
+which are not always easy to verify
+and that many of these guarantees are _asymptotic_.
+This means they are proven in the limit where we have an infinite number of samples from the posterior distribution.
+A very nice, if advanced, review on the subject can be found in @Roberts_mcmc_2004.
+As practitioners, we must contend with finite computational resources
+and assumptions which may or may not hold.
+The diagnostics we reviewed earlier, e.g. $\widehat R$, effective sample sizes,
+provide _necessary_ conditions for
+the MCMC sampler to work but not _sufficient_ ones.
+Nevertheless they are potent tools for diagnosing shortcomings in our inference.
+This section provides further such tools,
+from both a rigorous and a pragmatic perspective.
+
+
+Fitting the model to simulated data is, if done properly, an effective way
+to test whether our inference algorithm is reliable.
+If we cannot successfully fit the model in a controlled setting,
+it is unlikely we can do so with real data.
+This of course raises the question of what is meant by "successfully fitting"
+the model.
+In a Bayesian setting, this means our inference procedure recovers
+the correct posterior distribution.
+Unfortunately, even in a controlled setting,
+the posterior distribution is, but in the simplest cases, not tractable.
+
+A powerful method to check the accuracy of our Bayesian inference
+is _simulation-based calibration_ (SBC) [@Talts_sbc_2018].
+SBC exploits a very nice consistency result.
+The intuition is the following: 
+if we draw our parameters from our prior distribution
+$$
+  \theta_1, ..., \theta_2 \sim p(\theta)
+$$
+and for each $\theta_i$ simulate a data set $\mathcal Y^i$,
+we can by fitting the model multiple times recover the prior distribution
+from the estimated posteriors.
+This technique is a bit beyond the scope of this tutorial,
+though we vividly encourage the reader to consult the original paper, or to see [here](https://betanalpha.github.io/assets/case_studies/principled_bayesian_workflow.html) how this method fits in a principled Bayesian workflow.
+
+For the time being, we focus on a simpler heuristic:
+fit the model to one simulated data set and 
+check if we recover the correct parameter value.
+There are serious limitations with this approach:
+when do we consider that the estimated posterior distribution covers
+the correct value? How do we know if the variance of the posterior
+is properly estimated? etc.
+But the test is useful: in this controlled setting,
+do the chains converge?
+Is the computation of the log density numerically stable
+(e.g. are we using the right ODE integrator)?
+Do my priors prevent the chains from wondering into absurd regions
+of the parameter space?
+These are all questions this simple test can help us tackle.
+
+<!-- A quick check is to take one trajectory sampled from the prior, and check if we can retrieve the true parameters with our model. Still, altough this test can be useful to shed light on some issues with the model, it is far from enough to falsify or validate a model. See [@talts2018validating] for a discussion of this method and a correct way to check calibration by fitting draws from the prior distribution. -->
+
+We take one arbitrary draw from the prior distribution
+```{r}
+# one arbitrary draw from the prior distribution
+draw <- 12 
+# the number of predicted cases sampled from the prior distribution, which we will use as data
+cases_simu <- s_prior$pred_cases[draw,] 
+```
+
+And use it as data which we fit to our model.
+```{r}
+data_simu <-  list (n_days  = n_days, y0 = y0, t0 = t0, ts = t, N=N, cases=cases_simu)
+fit_simu <- sampling(model, 
+                     data=data_simu, 
+                     chains=4,
+                     seed = 0)
+```
+We can then examine the estimated posterior distribution. 
+<!-- Here we see it is the case. -->
+
+
+```{r}
+params = c("beta", "gamma", "phi")
+paste("true beta :", toString(s_prior$beta[draw]), 
+      ", true gamma :", toString(s_prior$gamma[draw]), ", true phi :", toString(s_prior$phi[draw]))
+print(fit_simu, pars = params)
+```
+We plot the posterior density (in red) to check if it matches the true value of the parameter (black line). 
+The density is compatible with the true parameters, although not always centered on it.
+The latter is not alarming, especially if the model parameter $\theta$ we sampled,
+lies on the tail of the prior distribution. We could repeat this process a few times to get a better sense of the performance of our inference algorithm.
+
+```{r}
+plot_beta <- stan_dens(fit_simu, pars="beta", fill = c_simu) + geom_vline(xintercept =s_prior$beta[draw])
+plot_gamma <- stan_dens(fit_simu, pars="gamma", fill = c_simu) + geom_vline(xintercept = s_prior$gamma[draw])
+plot_phi <- stan_dens(fit_simu, pars="phi_inv", fill = c_simu) + geom_vline(xintercept = s_prior$phi_inv[draw])
+grid.arrange(plot_beta, plot_gamma, plot_phi, nrow=1)
+```
+
+
+
+# 3 Scaling up ODE-based models
+
+Doing MCMC on ODE-based models can be computationally intensive,
+especially as we scale up the number of observations, parameters,
+and start using more sophisticated ODEs.
+If we want to ripe the benefits of a full Bayesian inference,
+we have to pay the computational cost.
+But while we cannot get away with a free lunch,
+we can avoid an overpriced one.
+Stan is a flexible language, which means there are worse and better ways of coding things.
+This section develops a few principles to make ODE models in Stan
+more scalable, 
+drawing on our experience with an SEIR model of Covid-19 [@Riou_covid_2020].
+
+## The Computational cost of Stan
+
+Stan abstracts the inference away from the modeling but it's worth
+taking a peek inside the black box.
+Markov chains are constructed using a dynamic Hamiltonian Monte Carlo (HMC)
+sampler [e.g @Betancourt_hmc_2018; @Hoffman_nuts_2014].
+To run the sampler, we need to specify the log joint density over
+the observations, $\mathcal Y$, and the latent variables, $\theta$,
+$$
+  \log p(\mathcal Y, \theta) = \log p(\mathcal Y \mid \theta) + \log p(\theta)
+$$
+which conveniently splits between a log likelihood and a log prior.
+This is ultimately what we specify in the `model` block.
+In addition, Hamiltonian Monte Carlo uses the gradient 
+with respect to $\theta$,
+$$
+  \nabla_\theta \log p(\mathcal Y, \theta) = \nabla_\theta \log p(\theta \mid \mathcal Y).
+$$
+The gradient contains information about the posterior distribution which,
+when properly harnessed, allows us to efficiently sample from the posterior.
+Fortunately, the user does not need to specify the gradient.
+Instead, _automatic differentiation_ generates the requisite derivatives
+under the hood, based on computer code to evaluate the log joint density^[
+Though heavily used in computational statistics and machine learning,
+automatic differentiation remains an arcane subject for many practitioners;
+for a review on the subject, we recommend [@Margossian_ad_2019]. 
+A more comprehensive treatment can be found
+in [@Griewank_ad_2008].
+].
+But, just like evaluating $\log p(\mathcal Y, \theta)$, 
+differentiation has a computational cost.
+
+HMC simulates trajectories across the parameter space
+by numerically solving Hamilton's equations of motion.
+We solve these equations using a numerical leapfrog integrator.
+At each step the integrator takes, 
+we need to _evaluate and differentiate_ $\log p(\mathcal Y, \theta)$.
+
+## Partitioning the code into blocks
+
+This perspective informs how each model block scales.
+The `data` and parameters blocks are used to declare variables.
+The `transformed data` block is evaluated once.
+The `transformed parameters` and `model` blocks
+are evaluated and differentiated at each leapfrog step,
+which is multiple times per iteration.
+The `generated quantities` block is evaluated once per iteration.
+Hence operations in the `parameters` and `transformed parameters`
+blocks dominate the computational cost and should only entail
+operations that depend on $\theta$
+and are required to compute $\log p(\mathcal Y, \theta)$.
+
+In our boarding school model, the computation of $R_0$, for example,
+is relegated to `generated quantities`.
+Even though we want samples from $p(R_0 \mid \mathcal Y)$
+and $R_0$ depends on the model parameters,
+$R_0$ does not contribute to $\log p(\mathcal Y, \theta)$.
+In the model by @Riou_covid_2020, we integrate an ODE --
+denoting the solution $y$ -- in 
+`transformed parameters` from $t_0$ to $\tau$,
+the time of the last observation
+$$
+  \int_{t_0}^\tau f(y, t) \mathrm dt
+$$
+where
+$$
+  \frac{\mathrm d y}{\mathrm d t} = f(y, t).
+$$
+We then make additional predictions, from time $\tau$ to $\tau'$,
+$$
+  \int_\tau^{\tau'} f(y, t) \mathrm{d}t.
+$$
+Because these predicted solutions do not impact our likelihood,
+we do these calculations in `generated quantities`.
+Compared to the first integral, this second integration is computed 
+a small number of times
+and it is not differentiated, making its computational cost marginal.
+
+## Propagating derivatives through ODEs
+
+Our ODE is defined by
+$$
+  \frac{\mathrm d y}{\mathrm d t} = f(y, t, \vartheta, x).
+$$
+Here, $\vartheta$ contains inputs to $f$ that depend on the model parameters, $\theta$,
+while $x$ contains inputs which do _not_ depend on $\theta$
+and therefore remain fixed as the Markov chain moves through the parameter space.
+Note that in general, $\vartheta \neq \theta$.
+In the SIR model for example, $\vartheta$ is defined as
+```
+theta[1] = beta;
+theta[2] = gamma;
+```
+and contains two model parameters.
+Specifically $\vartheta = (\beta, \gamma)$, while $\theta = (\beta, \gamma, \phi^{-1})$.
+To define the integral, we additionally specify an initial time, $t_0$,
+times of integration, $\tau$, and an initial condition, $y_0$,
+all of which can vary with $\theta$.
+Hence when propagating derivatives to compute the gradient of the log joint density,
+we need to worry about how the solution varies
+with respect to $\vartheta$ and potentially $y_0$^[
+While $t_0$ and $\tau$ may depend on model parameters, 
+we here assume they do not to avoid some minute technicalities 
+and simplify our discussion.].
+We say that these elements are _varying parameters_
+and denote $K$ the number of such elements.
+Furthermore, let $N$ be the number of _states_, that is the length of $y$
+or in a SIR model, the number of compartments.
+
+In Stan, we propagate derivatives by solving a coupled system of ODEs.
+The intuition is the following.
+Suppose we want to compute
+$$
+  \frac{\mathrm d y}{\mathrm d \vartheta}.
+$$
+We do not have an analytical expression for $y$, so a direct
+application of automatic differentiation is not feasible.
+But we can, assuming the requisite derivatives exist, compute
+$$
+  \frac{\mathrm d f}{\mathrm d \vartheta} = \frac{\mathrm d}{\mathrm dt} 
+    \frac{\mathrm dy}{\mathrm d \vartheta}
+$$
+and then integrate this quantity numerically.
+The end result is that, instead of only solving for the $N$ original states,
+we solve an $N + NK$ system to both evaluate and differentiate $y$.
+
+Strictly speaking, we do not need to explicitly compute 
+$\mathrm d y / \mathrm d \vartheta$ to propagate derivatives;
+this is an important, if somewhat counter-intuitive, result of automatic differentiation,
+and motivates a so-called _adjoint method_^[For a discussion on adjoint methods, we
+recommend @Hindmarsh_ode_2020.],
+which only requires solving $2N + K$ ODE states.
+While this method is very much on our todo list,
+it is not yet implemented in Stan.
+But the takeaway is the same for both methods: we should minimize $K$ as much as possible.
+
+### Splitting fixed and varying parameters
+
+This sheds light on the function signature of Stan's numerical integrator.
+For every element in `theta`, we add an additional $N$ states to solve for.
+Hence, components which do not depend on $\theta$ should be relegated
+to `x_r` and `x_i`.
+
+### Fixing the initial conditions (where we can)
+
+Suppose our initial condition, $y_0$, are varying parameters,
+i.e. depend on the model parameters.
+It is not uncommon for some of the elements in $y_0$ to not depend on $\theta$.
+For example, in a compartment model, 
+the initial condition for the first compartment may depend on model parameters,
+while it is 0 for the other compartments.
+More generally, $y_0$ may only depend on $k < N$ parameters.
+The straightforward approach is to pass $y_0$ as a vector of parameters.
+Stan interprets this as $N$ additional varying parameters,
+which means the number of ODE we solve increases by $N^2$.
+This is overpriced lunch!
+
+A better, if more intricate, approach is to solve the ODEs for deviations from the baseline
+and split $y_0$ between `theta` and `x_r`.
+
+Concretely, let 
+$$ 
+  z = y - y_0 .
+$$
+The initial condition for $z$ is then $\bf 0$, an $N$-vector of 0's
+and a fixed quantity.
+Now,
+$$
+  \frac{\mathrm d z}{\mathrm d t} = \frac{\mathrm d y}{\mathrm dt} = f(z + y_0, t, \vartheta, x)
+    = \widetilde{f}(z, t, \widetilde \vartheta, \widetilde x)
+$$
+where $\widetilde f$ is the same map as $f$,
+but applied to $z + y_0$ instead of $z$;
+$\widetilde \vartheta$ contains $\vartheta$
+and the elements of $y_0$ that depend on $\theta$;
+and $\widetilde x$ contains $x$ and the elements of $y_0$
+that are fixed.
+With this implementation, $K$ is kept to a minimum.
+We recover the original $y$ simply by adding $y_0$ to $z$.
+
+In the SEIR model by [@Riou_covid_2020], we have 58 initial conditions
+but together these depend on a single parameter.
+$\vartheta$ itself contains 4 elements.
+Reparameterizing the ODE means we go from $K = 62$ to $K = 5$,
+that is from solving 3596 coupled ODEs to only solving 290.
+
+
+## Picking the right ODE integrator
+
+The task of solving and differentiating an ODE boils down
+to integrating a coupled ODE system.
+Hence to sure reasonable performance,
+it is crucial to pick the right solver.
+
+### Arsenal of tools
+
+Stan provides a few options [e.g. @margossian_differential_2017].
+When available, the user can specify analytical solutions.
+If the ODE is linear, that is it has the form
+$$
+  \frac{\mathrm d y}{\mathrm d t} = Ay
+$$
+for some matrix $A$, then the solution is $e^{tA}y_0$,
+where $e$ designates the matrix exponential.
+Stan supports the computation and differentiation of the matrix exponential.
+These methods usually run faster than numerical integrators
+and should be used when possible.
+
+The majority of the time, we deal with nonlinear ODEs
+with no analytical solution and must resort to numerical integrators.
+In the special case where the ODE can be decoupled,
+it is possible to combine different integration methods.
+For example, the ODE may have the form
+\begin{eqnarray*}
+  \frac{\mathrm d y_1}{\mathrm d t} & = & f(y_1, t) \\
+  \frac{\mathrm d y_2}{\mathrm d t} & = & f(y_1, y_2, t)
+\end{eqnarray*}
+in which case we can independently solve for $y_1$ and then solve for $y_2$.
+This scenario arises when $y_2$ is subjected to a forcing function,
+which is itself the solution to a (simple) ODE.
+We can then solve $y_1$ analytically and $y_2$ numerically,
+and get a decent speed up [e.g. @margossian_mixed_solver_2017].
+But we may be trading computational time for coding time.
+
+### Numerical integrators
+
+Stan supports a Runge-Kutta (rk45) method for non-stiff systems,
+```
+integrate_ode_rk45
+```
+and a backward differentiation (bdf) algorithm for stiff systems
+```
+integrate_ode_bdf
+```
+There is no formal definition of stiffness
+but the general idea is that the phenomenon occurs when
+the time step of the integrator needs to be extremely small
+-- smaller than what is needed to achieve the required
+accuracy -- in order to make the integrator stable.
+Stiffness can arise when the scale of the solution varies largely
+as a function of $t$.
+The rk45 integrator is typically faster, so we recommend it as a starting point.
+If however the system is stiff, the rk45 integrator will be numerically unstable.
+It is not uncommon for the bdf method, when it is warranted,
+to produce much more efficient inference.
+
+Users should therefore be prepared to adjust their solver.
+This can mean switching from rk45 to bdf,
+or adjusting the tuning parameters of the integrator,
+namely the relative and absolute tolerances, and the maximum number of steps.
+These features are detailed in the [user manual](https://mc-stan.org/docs/2_23/stan-users-guide/ode-solver-chapter.html).
+When an integrator fails to solve an ODE,
+Stan issues a warning message and rejects the iteration being computed.
+An excessive number of such failures can indicate the integrator needs to
+be adjusted.
+
+For certain problems,
+knowing a priori if a system is stiff may not be obvious.
+What is even less obvious is whether a coupled system is stiff.
+And what is yet again less obvious is whether a system is stiff or nonstiff
+across the range of parameters the Markov chain explores,
+both during the warmup and the sampling phases.
+During warmup the chain can indeed land in odd regions
+of the parameter space and the ODE can have an unexpected behavior.
+This is not a fault of the sampler, per se, because we need to explore the
+parameter space in order to find regions where the probability mass is high.
+_But it may be a fault of the model_ 
+if our priors allow for the parameters to take absurd values.
+Constructing more informative priors is then well spent effort,
+very much in line with what the _folk theorem of statistical computing_^["
+When you have computational problems, often there’s a problem with your model.",
+see https://statmodeling.stat.columbia.edu/2008/05/13/the_folk_theore/.
+] prescribes.
+
+
+
+# 4 COVID-19 transmission in Switzerland
+To illustrate the ideas presented in this tutorial, we are going to tackle a more complex example: COVID-19 transmission in Switzerland during the period from February 2020 to June 2020. We'll see that in this more complicated setting, sampling from the posterior distribution can be difficult, and we'll need to rely on Stan's diagnostics to check that our inference is reliable.
+
+## Data import 
+
+```{r, message=F}
+library(tidybayes)
+library(gridExtra)
+df_swiss <- read_csv("data/swiss_agg_data.csv")
+```
+
+We first import the Switzerland data on reported cases. The figure below displays the number of cases (positive PCR tests) reported each day over the considered period of time.
+```{r}
+df_swiss %>% 
+  ggplot() + 
+  geom_bar(mapping = aes(x = date, y = report_dt), fill = c_mid, color = c_dark, stat = "identity") +
+  labs(y="Number of reported cases")
+```
+
+
+
+## A first attempt
+We are going to fit our basic model to the COVID-19 data, but we first need to make a few changes. In the influenza example, the number of students in bed was data on the disease *prevalence*, that is the number of students infected at time t. In this new setting, we only have access to the number of *new* cases on each given day, which constitutes *incidence* data. In a SIR model, the incidence of the disease at time t is the number of people leaving the Susceptible compartment at time t.
+
+We add the following code in the `transformed parameters` block:
+```{stan, eval=F, output.var="md"}
+for (i in 1:n_days-1) 
+  incidence[i] = y[i, 1] - y[i + 1, 1]; //S(t) - S(t + 1)
+```
+
+We assume the total population size to be constant and equal to 8.57*10^6. We also assume that the spread has started with one case, leading to initial conditions $I_0=1, R0=0, S0=N-I0$.
+
+```{r}
+# Swiss population
+N <- 8.57E6;
+
+#initial conditions
+i0 <- 1
+s0 <- N - i0
+r0 <- 0
+y0 = c(S = s0, I = i0, R = r0)
+```
+
+
+We keep the same *weakly-informative* priors for our first attempt:
+
+```{r}
+s_prior <- rstan::extract(fit_sir_prior)
+ggplot(tibble(r = s_prior$recovery_time)) + 
+  geom_density(aes(x = r),fill=c_prior, alpha = 0.6) + 
+  geom_vline(xintercept = c(0.5,30), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Recovery time (days, log)",y="Probability density")
+
+ggplot(tibble(r = s_prior$R0)) + 
+  geom_density(aes(x = r),fill=c_prior, alpha = 0.6) + 
+  geom_vline(xintercept = c(1,10), color = "red",linetype=2) + 
+  scale_x_log10() +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Basic reproduction number (log)",y="Probability density")
+```
+
+
+
+and the same negative-binomial likelihood (to account for overdispersion, whereas e.g a Poisson distribution would constrain the variance to be equal to the mean) and we fit these incidence parameters to the data:
+
+```{stan, eval=F, output.var="md"}
+cases[1:(n_days-1)] ~ neg_binomial_2(incidence, phi);
+```
+
+Let's try fitting this modified model:
+
+```{r}
+sir_model <- stan_model("stan_models/models_swiss/sir_incidence.stan")
+```
+
+```{r}
+# Cases
+cases <- df_swiss$report_dt
+
+# times
+n_days <- length(cases)
+t <- seq(1, n_days, by = 1)
+t0 = 0
+t <- t
+
+data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cases)
+```
+
+
+```{r}
+fit_sir <- sampling(sir_model, 
+                    data_sir, 
+                    iter=1000,
+                    seed = 0)
+```
+
+```{r}
+check_hmc_diagnostics(fit_sir)
+```
+
+
+The diagnostics suggest our inference is not reliable. First and foremost, $\hat R$ is high, indicating the MCMC chains have not mixed. We also note that the Effective sample Size is low: our Monte Carlo estimates of the posterior mean and variance are therefore noisy. This is not uncommon when the chains fail to mix.
+
+We also get a warning messages about the algorithm hitting the *maximum treedepth*. This is a specific property of the adaptive HMC we are using -- a variant of the No-U Turn Sampler -- and suggests our algorithm is not as efficient as it might be. In an optimal setting, we simulate a Hamiltonian trajectory until it makes a "U-Turn" (@Hoffman_nuts_2014). If after running for a significant time, no U-turn occurs, the trajectory stops prematurely. What constitutes a significant time is determined by the maximum tree depth tuning parameter. The purpose of this second termination criterion is to safeguard us against running trajectories for an excessively longtime. Strictly speaking, this does not mean our inference is unreliable. Rather it indicates that subsequent samples are relatively close to one another and that it takes many iterations to move across the relevant regions of the parameter space. Furthermore our algorithm might be computationally slow, because every Hamiltonian trajectory at every iteration is run for a long time. There are many pathologies that can cause this issue and without further diagnostics, we can only speculate as to why this behavior arises in our model. In our experience, exceeded maximum treedepths rarely arise alone and it is easier to diagnose other warning messages. Often times (though not always!) addressing other issues fix the treedepth problem. If the exceeded max tree depth is the only issue, then increasing the maximum tree depth can make our sampling more efficient. 
+We also have a warning about divergences. Divergences occur when Stan’s Hamiltonian solver diverges from the true Hamiltonian, which must be conserved, because of numerical problems in the stepwise gradient-based approximation of the curvature of the log density. This indicates that the Markov chains did not completely explore the posterior and that our Markov chain Monte Carlo estimators will be biased. This is often the sign that some region of the posterior is hard to explore and that the step-size strongly depends on the location. Divergences, however, can sometimes be false positives. In genearal, to verify that we have real fitting issues we can rerun with a larger target acceptance probability, adapt_delta, which will force more accurate simulations of Hamiltonian trajectories and reduce the false positives.
+For more on the subject, the reader may consult [the guide to Stan's warnings](https://mc-stan.org/misc/warnings.html).
+
+As suggested by the large $\hat R$, we examine the traceplots. In this type of plot, each line represents an MCMC chain, and each point represent the sampled value of a specific parameter at each MCMC iteration. Such a plot allows us to see if all the chains are exploring the same space or, on the contrary, are stuck in different part of the posterior distribution.^[Note that using trace plots to assess convergence is a bad idea : such a visual inspection is less reliable that a metric like R-hat, and scales badly to high dimension. However, trace plots can be very useful to dig into the issue when Rhat is too high.] Here we can see that the inferred posterior distributions for each chain are very different: as the R-hat warning indicated, the MCMC chains are not mixing.
+
+```{r}
+traceplot(fit_sir, pars = c("gamma", "beta", "lp__"))
+```
+
+Furthermore, we plot the log-posterior density (the logarithm of the posterior density of each MCMC sample). Strictly speaking we examine the log-joint density, which is the log-posterior density *up to an additive constant*. This gives us a measure of how consistent a parameter sample is with the prior and the likelihood. We can use it to compare Markov chains and assess whether one chain produces samples that seem less consistent with our information than samples produced by another chain. If two chains sample across different modes but produce comparable log posteriors, this indicates our model is, bearing a slight abuse of language, "degenerate", i.e. different parameter values produce similar data generating processes. The log posterior density remains a crude diagnostic tool. Its value itself is meaningless and only serves to compare chains. Indeed when examining the log posterior density of a single chain, we cannot work out whether the model is a good fit or not. What is more, even as a comparison tool, it is fairly limited: modes with a low a density but a large volume can have as much probability mass as modes with a high density but a small volume. In our view, the main utility of examining the log posterior density is to motivate further diagnostics, such as doing *posterior predictive checks per chain*. This, we argue, is a more direct way of understanding the data generating process implied by various modes of the posterior density. If one chain produces comparibly inconsistent predictions, than that chain may be stuck at a *local mode* (i.e. a mode with a small probability mass that only makes a negligible contribution to the expectation). Here, there seem to be at least two posterior modes, at least one of which is local. So we might wonder if some of the chains are able to capture a reasonable data generating process. We can check the model median predictions for each chain (the data are the black points, and the median prediction is the red line.).
+
+```{r, warning=FALSE, message=FALSE}
+fit_sir %>% 
+  spread_draws(pred_cases[n_days]) %>% 
+  left_join(tibble(cases = cases, n_days = 1:length(cases))) %>% 
+  group_by(n_days, .chain) %>% 
+  summarise(cases = mean(cases), pred_median = median(pred_cases), pred_9 = quantile(pred_cases, 0.95), pred_1 = quantile(pred_cases, 0.05)) %>% 
+   ggplot(aes(x = n_days)) +
+   #geom_ribbon(aes(ymin = pred_1, ymax = pred_9), fill = c_mid, alpha=0.7)+
+   geom_line(mapping = aes(y=pred_median), color = c_posterior)+
+   geom_point(mapping = aes(y=cases), size=0.1)+
+  facet_wrap(~.chain, scales = "free")
+```
+
+Although chains 1, 2 and 3, which had a higher log-posterior on the traceplot, provide a better fit to the data, the predictions from all chains are very far from the data.
+
+What do all these issues tell us? One of these three things:
+
+1) There is a bug in our code.
+
+2) The model would be fine if the posterior distribution were correctly sampled, but our *inference* is unable to characterize the posterior.
+
+3) Per Folk's theorem^[https://statmodeling.stat.columbia.edu/2008/05/13/the_folk_theore/], the *inference* problem is a symptom of a *modeling* problem: the model does not fit the data, for instance is not identifiable. In other words, the model is *misspecified*.
+
+Checking code for bugs is hard, and a subject worthy of longer treatment, but let’s assume here that our simple code is bug-proof. Hypothesis 2 is plausible: in practice there is now way of excluding it, rather we can check whether a set of necessary conditions fail. Hypothesis 3 seems very likely: this simple model does not capture some essential propertied of COVID dynamics, and the predictions it gives are far enough from the data that we can be quite confident that the model is misspecified.
+
+## Improving the model
+Our basic model doesn't match our data. To make it fit, we can think of different improvements to the model to reflect the dynamics of disease:
+
+1) Due to the size of the COVID-19 epidemic and to limited testing capacities, there have been massive underreporting of cases. Our model could take this into account.
+
+2) Switzerland has put lock-down measures into place, and people have modified their behaviour in reaction to the virus: parameter $\beta$ is not constant over time.
+
+3) We could account for the incubation time.
+
+5) We could account for the reporting time.
+
+6) We could make the initial number of infected people a parameter of the model.
+
+7) Given the growing literature on COVID-19, we could add information to our model. This can mean making our priors more informative, or adding different data.
+
+We are going to incorporate several of these improvements into the model. We are going to do it one improvement at a time, to be able to understand where issues are coming from when it happens.
+
+### Incorporating underreporting
+Let's start with improvement 1, underreporting. We add a single parameter `p_reported` is the proportion of cases which get reported.
+
+The `parameters` code block becomes:
+```{stan, eval=F, output.var="md"}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> phi_inv;
+  real<lower=0, upper=1> p_reported; // proportion of infected (symptomatic) people reported
+}
+```
+
+The incidence computation in the `transformed parameters` block becomes:
+```{stan, eval=F, output.var="md"}
+for (i in 1:n_days-1){
+    incidence[i] =  (y[i, 1] - y[i+1, 1]) * p_reported;
+  }
+```
+
+We give `p_reported` a weakly-informative $\beta(1, 2)$ prior, which indicates that we are quite uncertain about this parameter, except that it's between 0 and 1 and shouldn't be too close to 1. In the `model` block:
+```{stan, eval=F, output.var="md"}
+p_reported ~ beta(1, 2);
+```
+
+Let's compile this new model.
+```{r}
+model_sir_underreporting <- stan_model("stan_models/models_swiss/sir_underreporting.stan")
+```
+And fit it to the Swiss incidence data.
+```{r}
+fit_sir_underreporting <- sampling(model_sir_underreporting, 
+                                   data_sir, 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+```{r}
+check_hmc_diagnostics(fit_sir_underreporting)
+```
+
+Stan doesn't complain anymore: R-hat is close to one (< 1.01), which indicates that the MCMC chains have mixed, and all the other diagnostics are green. Thus we can be quite confident that Stan is correctly exploring the true posterior distribution of the parameters.^[If we suspect multimodality, we can try with more than 4 chains. Here for instance, running with 8 chains makes 1 chain among 8 explore a different part of the posterior. This doesn't change our conclusions here but could be more problematic if it was our final model.] But does the model capture the dynamics in the data well? We can do a posterior predictive check:
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_sir_underreporting, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cases[1:length(cases)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = c_posterior, alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = c_posterior) +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence")
+```
+
+We can see that the prediction is considerably better than in the previous case. In particular, the uncertainty on the prediction is no longer off by orders of magnitude. Still, it is off, and the predicted cases are skewed. It could be that our priors don't match our data, but we have chosen them uninformative enough that it shouldn't break our model. Thus it is likely that the model is simply missing crucial properties of the process generating our data. What the best way forward? Incorporating incubation time and varying initial infections into the model seems like a good start. Given that the model predictions seem translated forward compared to our data, allowing the model to delay or rush transmission might solve our problems.
+
+### Incorportating incubation time and varying initial infections.
+
+We transform the SIR model into a SEIR model, where people are *Exposed* before being infected. We suppose that *Exposed* people are not contagious, whereas *Infectious* people are. Furthermore, we suppose that people are reported as soon as they become *Infectious*. We add a parameter $a$, where $\frac{1}{a}$ corresponds to the average time between being infected and becoming infectious (for simplicity we also use $\frac{1}{a}$ as the time between being infected and being reported).
+
+SEIR equations become:
+
+$$
+\begin{aligned}
+ \frac{dS}{dt} &= -\beta  S \frac{I}{N}\\
+ \frac{dE}{dt} &= \beta S \frac{I}{N} - a E\\
+ \frac{dI}{dt} &= aE - \gamma  I \\
+ \frac{dR}{dt} &= \gamma I
+\end{aligned}
+$$
+
+<img src="pictures/SEIR_tik.jpg" alt="SEIR graph" width="500" align="center"/>
+
+We add the same weakly-informative prior $N(0.4, 0.5)$ on $a$ that we added on $\gamma$, which means that we expect the average time between being infected and becoming infectious to be roughly between half a day and thirty days.
+
+The incidence is now the number of people leaving the E compartment, i.e $E(t) - E(t+1) + S(t) - S(t+1)$^[E(t) - E(t+1) is the number of people leaving the E compartment minus the number of people entering E. S(t) - S(t+1) is the number of people entering E].
+```{stan, eval=F, output.var = "md"}
+  for (i in 1:n_days-1){
+    incidence[i] = -(y[i+1, 2] - y[i, 2] + y[i+1, 1] - y[i, 1]) * p_reported; //E(t) - E(t+1) + S(t) - S(t+1)
+  }
+```
+
+
+We also allow the initial number of infected and exposed people to vary: we add parameters $i_0$ and $e_0$, with weakly informative priors $N(0, 10)$^[We keep $r_0 =0$: in February there might already be a few recovered people, but their number can't be high enough to influence transmission dynamics]. Remember Section 3: we always want to minimize the number $K$ of parameters given to the ODE function. Thus we don't add $y_0$ as a parameter of the ODE function. We only add $i_0$ and $e_0$, and reconstruct $y_0$ in the ODE function. This way, we only add $\propto (N+1)*2 = 10$ ODEs to solve at each HMC step instead of $\propto (N+1) * 4 = 20$. This advice gets more important as the number of compartments gets bigger.
+
+Thus the call to the ODE solver becomes:
+
+```{stan, eval=F, output.var = "md"}
+//real theta[3] = {beta, gamma, a}; //slow
+//y = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i); 
+real theta[5] = {beta, gamma, a, i0, e0}; //fast
+y = integrate_ode_rk45(sir, rep_array(0.0, 4), t0, ts, theta, x_r, x_i);
+```
+
+And the SEIR code becomes:
+
+```{stan, eval=F, output.var="md"}
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real N = x_i[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      real a = theta[3];
+      real i0 = theta[4];
+      real e0 = theta[5];
+      
+      real init[4] = {N - i0 - e0, e0, i0, 0}; // we reconstruct y0
+      real S = y[1] + init[1];
+      real E = y[2] + init[2];
+      real I = y[3] + init[3];
+      real R = y[4] + init[4];
+      
+      real dS_dt = -beta * I * S / N;
+      real dE_dt =  beta * I * S / N - a * E;
+      real dI_dt = a * E - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dE_dt, dI_dt, dR_dt};
+  }
+```
+
+We compile this new model and fit it to the data:
+
+```{r}
+data_seir <- list(n_days = n_days, t0 = t0, ts = t, N = N, cases = cases)
+model_seir <- stan_model("stan_models/models_swiss/seir_indicence.stan")
+fit_seir <- sampling(model_seir, 
+                     data_seir, 
+                     iter = 1000,
+                     seed = 0)
+```
+Stan warnings indicate that Rhat is too large: the chains haven't mixed. 
+We can look at the parameter values for each chain by looking at a trace plot:
+```{r}
+traceplot(fit_seir, pars = c("beta", "gamma", "a", "lp__"))
+```
+
+We can see that the chains are not mixing: chains 1, 3 and 4 are exploring a region of high transmission and high incubation time, whereas chains 2 is exploring a region of low transmission and low incubation time. We can plot a posterior predictive check for each chain:
+
+```{r, warning=FALSE, message=F}
+fit_seir %>% 
+  spread_draws(pred_cases[n_days]) %>% 
+  left_join(tibble(cases = cases, n_days = 1:length(cases))) %>% 
+  group_by(n_days, .chain) %>% 
+  summarise(cases = mean(cases), pred_mean = mean(pred_cases), pred_9 = quantile(pred_cases, 0.95), pred_1 = quantile(pred_cases, 0.05)) %>% 
+   ggplot(aes(x = n_days)) +
+   geom_ribbon(aes(ymin = pred_1, ymax = pred_9), fill = c_posterior, alpha=0.35)+
+   geom_line(mapping = aes(y=pred_mean), color = c_posterior)+
+   geom_point(mapping = aes(y=cases), size=0.1)+
+  facet_wrap(~.chain)
+```
+
+It seems that only chains 1, 3 and 4 provide a good fit to the data (and have a much higher log-posterior in the trace plot).^[Sometimes, such a multimodality issue comes from the default initial values from the Stan sampler, which can lock the model in a local mode. Such an issue can be diagnosed by including warmup samples in the trace plot `traceplot(fit_seir, pars = c("beta", "gamma", "a", "lp__"), inc_warmup = T)` and solved by [setting the initial values manually](https://mc-stan.org/docs/2_24/reference-manual/initialization.html). Here, this does not appear to be the issue.] Looking back, the inferred parameters from chain 2 seem highly unrealistic. Here is the distribution of $a$ for chain 2.
+
+```{r}
+fit_seir %>% 
+  spread_draws(a) %>% 
+  filter(.chain == 2) %>% 
+  ggplot() +
+  geom_histogram(mapping = aes(x = a), fill=c_posterior, color=c_dark)
+```
+
+Most of the probability mass implies that the time between infection and infectiousness is less than half a day. However, we know from the literature that the incubation time (average time between infection and symptoms) and generation time (average time between the symptom onsets of the infectious and the infected) are around 5 days^[*Qifang Bi, Yongsheng Wu, Shujiang Mei, Chenfei Ye, Xuan Zou, Zhen Zhang, Xiaojian Liu, Lan Wei, Shaun A Truelove, Tong Zhang, et al. Epidemiology and transmission of COVID-19 in shenzhen china: Analysis of 391 cases and 1,286 of their close contacts. MedRxiv, 2020.* for the incubation time. *Tapiwa Ganyani, Cecile Kremer, Dongxuan Chen, Andrea Torneri, Christel Faes, Jacco Wallinga, and Niel Hens. Estimating the generation interval for COVID-19 based on symptom onset data. medRxiv, 2020.* for the generation time]. Therefore the time between infection and infectiousness can't be so low. 
+
+Until now, we have only used weakly-informative priors. But here we need to overcome multimodality, and we have accessible domain knowledge: we can refine our prior on $a$. In this case, it is easier to specify our domain knowledge on the inverse of $a$. We choose the informative prior $inv(a) \sim \mathcal{N}(6, 1)$, which means there is a priori a greater than 99% chance that our incubation time is between 3 and 9. This should remove posterior probability mass from the region currently explored by chain 1 and 3, and make inference easier.
+
+We fit the modified model:
+
+```{r}
+model_seir_informative <- stan_model("stan_models/models_swiss/seir_incidence_informative.stan")
+fit_seir_informative <- sampling(model_seir_informative, 
+                                 data_seir, 
+                                 iter=1000,
+                                 seed=0)
+```
+
+Stan doesn't stop complaining: R-hat is still high. Let's look at the trace plot:
+
+```{r}
+traceplot(fit_seir_informative, pars = c("beta", "gamma", "inv_a", "a", "p_reported", "i0", "e0", "lp__"))
+```
+
+`inv_a` is still multimodal. We could try to refine our prior on `inv_a` to something even more informative, but we don't have enough information.^[in our model`inv_a` represent both the time between infection and infectiousness and the time between infection and report, which makes gathering precise domain knowledge difficult] What about `p_reported`? The low values are hard to read on the traceplot, so we look at the summary:
+
+```{r}
+summary(fit_seir_informative, pars = c("p_reported"))$c_summary
+```
+
+Some chains find a very small value for this parameter, which would imply that almost the whole population of Switzerland has been infected. We can actually explain it. Right now, the model includes only one way to decrease transmission: people becoming immune after having been infected. As the data show a decrease in contaminations, the model is tempted to infer a high number of immune people, and thus a low proportion of case report. However, serological studies^[https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)31304-0/fulltext] have shown that the total number of cases in Switzerland is not far from 10% of the population by May 2020. The decrease in transmission must be due to something else than immunity, and indeed control measures have been taken by the federal government around March 13th.
+
+### Modeling control measures
+
+We model decreasing transmission due to governmental control measure by a logistic function: $\beta(t) = f(t) * \beta$, with $f(t) = \eta + (1 - \eta) * \frac{1}{1 + exp(\xi * (t - t_1 - \nu))}$, where $\eta$ is the decrease of transmission while control measures are fully in place, $\xi$ is the slope of the decrease, and $\nu$ is the delay (after the date of introduction of control measures) until the measures are 50% effective.
+
+In Stan, in the `functions` code block we add:
+```{stan, eval=F, output.var="md"}
+real switch_eta(real t, real t1, real eta, real nu, real xi) {
+    return(eta+(1-eta)/(1+exp(xi*(t-t1-nu))));
+}
+```
+
+We add weakly-informative priors on the three parameters. $\eta \sim \beta(2.5, 4)$ which means we expect governmental measures to reduce transmission, but not all the way to zero. $\nu \sim exponential(1/5)$ which means the delay should be around a week but could be lower or quite higher. $\xi \sim \mathcal{U}(0.5, 1.5)$, which means the slope has to be positive.
+
+```{r}
+date_switch <- "2020-03-13" # date of introduction of control measures
+tswitch <- df_swiss %>% filter(date < date_switch) %>% nrow() + 1 # convert time to number
+
+data_forcing <- list(n_days = n_days, t0 = t0, ts = t, N = N, cases = cases, tswitch = tswitch)
+model_forcing <- stan_model("stan_models/models_swiss/seir_forcing.stan")
+fit_forcing <- sampling(model_forcing, 
+                        data_forcing, 
+                        iter=1000,
+                        seed=4)
+```
+
+Stan complains of a few divergences, but there is no warning on R-hat: the chains seem to be mixing.
+
+Still, we look at the pairs plot to analyse the inferred posterior distribution. A pairs plot shows the coupled values of pairs of parameters. This plot is useful to grasp the geometry of the posterior.
+
+```{r}
+pairs(fit_forcing, pars = c("beta", "gamma", "a", "p_reported", "eta", "nu", "xi"))
+```
+
+Pairs plots are useful to observe correlations between parameters, for instance here between beta and gamma, to analyse more bizarre relationships between parameters, for instance here the relationship between a and nu, and to diagnostic specific inference issues ([for instance if all the red points indicating divergences were concentrated in a specific region](https://mc-stan.org/misc/warnings.html)). We can make several remarks. First, `p_reported` is still very low. Second, the posterior distributions of `eta`, `nu` and `xi`, the three parameters controlling the effect of governmental measures, are quite uninformative and similar to their prior distributions. Indeed, we can guess that because `p_reported` is low, transmission can decrease substantially through immunity only, rendering the effect of control measures non identifiable, or at least [degenerate](https://betanalpha.github.io/assets/case_studies/identifiability.html).
+
+We know that `p_reported` can't be so low: this is an information we want to add to the model. This information can take the form of a prior: we could try to refine the prior on `p_reported` to incorporate more precise domain knowledge. This information can also take the form of additional data: here we can directly fit the data from serological tests into the model!
+
+### Fitting data from a serological survey
+
+We are going to use data from the [Lancet survey published in June 2020](https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)31304-0/fulltext). For simplicity, we only fit the results from week 5 of the survey, neglect consideration of tests sensitivity and specificity^[for a proper Bayesian treatment of these considerations with Stan, see [this paper](http://www.stat.columbia.edu/~gelman/research/unpublished/specificity.pdf) by Gelman and Carpenter], and makes the (strong) assumption that the results from Geneva are representative of Switzerland as a whole. Tests from week 5 have taken place in Geneva from May the 4th to May the 7th, and researchers have found 83 people with Covid-19 antibody on 775 people tested.
+
+```{r}
+date_survey_left <- "2020-05-04"
+date_survey_right <- "2020-05-07"
+t_survey_start <- df_swiss %>% filter(date < date_survey_left) %>% nrow() + 1 # convert time to number
+t_survey_end <- df_swiss %>% filter(date < date_survey_right) %>% nrow() + 1 # convert time to number
+n_infected_survey <-  83
+n_tested_survey <-  775
+# add these data to the data given to stan
+data_forcing_survey <- c(data_forcing, list(t_survey_start = t_survey_start, 
+                                                t_survey_end = t_survey_end,
+                                                n_infected_survey = n_infected_survey,
+                                                n_tested_survey = n_tested_survey))
+```
+
+Anti-body test sensitivity is time-dependent and becomes good (around 85%) at 2 weeks and gets better afterwards^[https://www.bmj.com/content/370/bmj.m2516]. Recovery time for mild cases is about two weeks, for severe cases three to six weeks^[https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf p.14]. Given that the time to develop detectable antibodies and the recovery time are quite similar, we can identify people having detectable COVID-19 antibodies with people in the R compartment of our model. Given this assumption, the probability of being detected by the survey is the proportion of people in the R compartment during the survey.
+
+In the `transformed_parameters` code block we add:
+```{stan, eval=F, output.var = "md"}
+p_infected_survey = mean(to_vector(y[t_survey_start:t_survey_end, 4])) / N;
+```
+
+We use a binomial likelihood to fit the model to the data from the antibody survey. In the `model` code block we add:
+```{stan, eval=F, output.var = "md"}
+n_infected_survey ~ binomial(n_tested_survey, p_infected_survey);
+```
+
+We compile the model and launch the sampler:
+```{r}
+model_forcing_survey <- stan_model("stan_models/models_swiss/seir_forcing_survey.stan")
+fit_forcing_survey <- sampling(model_forcing_survey, 
+                               data_forcing_survey, 
+                               iter=1000,
+                               seed=0)
+```
+
+Stan diagnostics are green, except for the fact that the maximum tree depth is often exceeded. This means that Stan had to choose a step size small enough to explore some part of the posterior, but that this step size is too small for exploring another part of the posterior efficiently, slowing down the sampling process. This is not too worrying, given that the other diagnostics are good. Still, we can look at the pairs plot. Yellow points indicate maximum tree depth saturation, and red points indicate divergences (which mean the step size is too big).
+
+```{r}
+pairs(fit_forcing_survey, pars = c("beta", "gamma", "a", "p_reported", "nu", "xi", "eta"))
+```
+
+The posterior may not be easy to explore, for instance due to the close dependency between `a` and `eta` but nothing seems particularly worrying. We can increase the maximum tree depth and try again.
+
+```{r}
+fit_forcing_survey_max <- sampling(model_forcing_survey, 
+                                   data_forcing_survey,  
+                                   control = list(max_treedepth = 13, adapt_delta=0.9), 
+                                   iter=1000,
+                                   seed = 0)
+```
+
+```{r}
+check_hmc_diagnostics(fit_forcing_survey_max)
+```
+
+This time we get no warning: it seems that the MCMC sampler is able to explore the posterior distribution successfully. `p_reported` now seems reasonable (around 3%):
+
+```{r}
+stan_hist(fit_forcing_survey_max, pars = "p_reported", fill = c_posterior, color=c_dark)
+```
+
+Furthermore, a posterior predictive check indicates that the model matches the data:
+
+```{r}
+smr_pred <- cbind(as.data.frame(summary(fit_forcing_survey_max, pars = "pred_cases", probs = c(0.025, 0.05, 0.1, 0.5, 0.9, 0.95, 0.975))$summary), t=1:(n_days-1), cases = cases[1:length(cases)-1])
+colnames(smr_pred) <- make.names(colnames(smr_pred)) # to remove % in the col names
+
+ggplot(smr_pred, mapping = aes(x = t)) +
+  #geom_ribbon(aes(ymin = X2.5., ymax = X97.5.), fill = c_dark, ) +
+  geom_ribbon(aes(ymin = X5., ymax = X95.), fill = c_posterior, alpha=0.35) +
+  #geom_ribbon(aes(ymin = X10., ymax = X90.), fill = c_light) +
+  geom_line(mapping = aes(x = t, y = X50.), color = c_posterior) +
+  geom_point(mapping = aes(y = cases)) +
+  labs(x = "Day", y = "Incidence")
+```
+
+In particular, the uncertainty seems reasonable. Looking at the pairs plot, `phi_inv` is around 0.15 a posteriori, which indicates overdispersion compared to a Poisson distribution. If we had chosen to use a Poisson likelihood, we can guess that our results would have been less satisfactory.
+
+We may be interested how the parameter $R_{0}(t)$, which corresponds to the average number of people infected by someone contracting the virus at time t, *taking into account environmental changes modifying transmission* such as people behavior or governmental policies. Because $R_{0}$ doesn't influence the joint posterior, we can compute it in the `generated quantities` code block for greater speed, as advised in section 3. We plot the decrease in $R_{0}$ inferred by the model: we can see it decreases below one after the governmental measures.
+
+```{r}
+fit_forcing_survey_max %>% 
+  spread_draws(Reff[n_days]) %>% 
+  group_by(n_days) %>% 
+  summarise(R0_mean = mean(Reff), R09 = quantile(Reff, 0.95), R01 = quantile(Reff, 0.05)) %>% 
+  ggplot() +
+  geom_ribbon(aes(x = n_days, ymin = R01, ymax = R09), fill = c_posterior, alpha=0.35)+
+  geom_line(mapping = aes(n_days, R0_mean), color = c_posterior) +
+  geom_vline(aes(xintercept = tswitch))
+```
+
+It can also be interesting to display the posterior distribution for each parameter, and to compare it to our initial prior.
+```{r}
+n = 4000
+prior = tibble(
+  beta = abs(rnorm(n,2,1)),
+  gamma = abs(rnorm(n,.4,.5)),
+  a = abs(rnorm(n,.4,.5)),
+  phi_inv = rexp(n,5),
+  p_reported = rbeta(n, 1, 2),
+  eta = rbeta(n, 2.5, 4),
+  nu = rexp(n,1./5),
+  xi = .5 + rbeta(n,1, 1)
+) %>%
+  pivot_longer(everything()) %>%
+  mutate(type="Prior")
+
+pars = c("beta","gamma","phi_inv","a","p_reported","eta","nu","xi")
+samp =
+  extract(fit_forcing_survey_max,pars) %>%
+  as.data.frame() %>%
+  pivot_longer(everything()) %>%
+  mutate(type="Posterior") %>%
+ bind_rows(prior) %>%
+  mutate(name=factor(name,levels=pars),
+         type=factor(type,levels=c("Prior","Posterior")))
+
+ggplot(samp) +
+  geom_density(aes(x=value,fill=type),alpha=.8) +
+  facet_wrap(~name,scale="free",ncol=4) +
+  scale_fill_manual(values=c(c_prior,c_posterior)) +
+  scale_y_continuous(expand=expansion(c(0,.05))) +
+  labs(x="Value",y="Probability density",fill=NULL) +
+  theme(legend.position="bottom")
+```
+
+
+We finally obtained a decent model, but note that its aim is only didactic and should not be directly used to inform policy. The first functioning model is not the end of the road, and a lot of features should be considered before claiming to have obtained a good depiction of the Swiss epidemic. For instance, one could account for the sensitivity and specificity of tests when fitting seroprevalence data, improve the inference by including data on testing, hospitalisations and deaths, relax some of the strong assumptions that were made, and stratify by age, location or some other characteristic. This would result in a large number of competing models that can be organised in a network depending on what features are included @gelman2020bayesian. Model comparison tools become invaluable in this context. Although it is out of the scope of this tutorial, we recommend using leave-one-out cross-validation^[https://mc-stan.org/loo/], or, even more adapted for time series, leave-future-out cross-validation. If we wanted to be sure that we have not missed any issues with Stan's diagnostics, we could also check the model calibration, ideally through Simulation Based Calibration or at least by simulating data (see section 2).
+
+## Stan codes
+
+### Final model
+
+```{stan, eval=F, output.var = "md"}
+functions {
+  real switch_eta(real t, real t1, real eta, real nu, real xi) {
+    return(eta + (1 - eta) / (1 + exp(xi * (t - t1 - nu))));
+  }
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      int N = x_i[1];
+      real tswitch = x_r[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      real a = theta[3];
+      real eta = theta[4]; // reduction in transmission rate after quarantine
+      real nu = theta[5]; // shift of quarantine implementation
+      real xi = theta[6]; // slope of quarantine implementation
+      real i0 = theta[7]; // initial number of infected people
+      real e0 = theta[8]; // initial number of infected people
+      real forcing_function = switch_eta(t,tswitch,eta,nu,xi); // switch function
+      real beta_eff = beta * forcing_function; // beta decreased to take control measures into account
+      real init[4] = {N - i0 - e0, e0, i0, 0}; // initial values
+
+      real S = y[1] + init[1];
+      real E = y[2] + init[2];
+      real I = y[3] + init[3];
+      real R = y[4] + init[4];
+      
+      real dS_dt = -beta_eff * I * S / N;
+      real dE_dt =  beta_eff * I * S / N - a * E;
+      real dI_dt = a * E - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dE_dt, dI_dt, dR_dt};
+  }
+}
+data {
+  int<lower=1> n_days;
+  real t0;
+  real tswitch; // date of introduction of control measures
+  real ts[n_days];
+  int N; // population size
+  int cases[n_days];
+  int t_survey_start; // antibody survey data
+  int t_survey_end;
+  int n_infected_survey;
+  int n_tested_survey;
+}
+transformed data {
+  int x_i[1] = { N }; //formatting to feed the ODE function
+  real x_r[1] = {tswitch};
+}
+parameters {
+  real<lower=0> gamma; // SEIR parameters
+  real<lower=0> beta;
+  real<lower=0> a;
+  real<lower=0> phi_inv; 
+  real<lower=0,upper=1> eta; // reduction in transmission due to control measures (in proportion of beta)
+  real<lower=0> nu; // shift of quarantine implementation (strictly positive as it can only occur after tswitch)
+  real<lower=0,upper=1> xi_raw; // slope of quarantine implementation (strictly positive as the logistic must be downward)
+  real<lower=0> i0; // number of infected people inititally
+  real<lower=0> e0; // number of exposed people inititally
+  real<lower=0, upper=1> p_reported; // probability for an infected person to be reported (i.e counted as a case)
+}
+transformed parameters{
+  real y[n_days, 4];
+  real incidence[n_days - 1];
+  real phi = 1. / phi_inv;
+  real xi = xi_raw + 0.5;
+  real theta[8];
+  real<lower=0, upper=1> p_infected_survey; //proportion of people having been infected at week 5 (between 4 and 7 may)
+  theta = {beta, gamma, a, eta, nu, xi, i0, e0};
+  y = integrate_ode_rk45(sir, rep_array(0.0, 4), t0, ts, theta, x_r, x_i);
+  for (i in 1:n_days-1){
+    incidence[i] = -(y[i+1, 2] - y[i, 2] + y[i+1, 1] - y[i, 1]) * p_reported; //-(E(t+1) - E(t) + S(t+1) - S(t))
+  }
+  // mean number of infected + recovered people during week 5
+  p_infected_survey = mean(to_vector(y[t_survey_start:t_survey_end, 4])) / N;
+}
+model {
+  //priors
+  beta ~ normal(2, 1);
+  gamma ~ normal(0.4, 0.5);
+  a ~ normal(0.4, 0.5);
+  phi_inv ~ exponential(5);
+  i0 ~ normal(0, 10);
+  e0 ~ normal(0, 10);
+  p_reported ~ beta(1, 2);
+  eta ~ beta(2.5, 4);
+  nu ~ exponential(1./5);
+  xi_raw ~ beta(1, 1);
+  
+  //sampling distribution
+  n_infected_survey ~ binomial(n_tested_survey, p_infected_survey); // we fit the survey data to our latent parameter
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
+  cases[1:(n_days-1)] ~ neg_binomial_2(incidence, phi);
+}
+generated quantities {
+  real R0 = beta / gamma;
+  real Reff[n_days]; // R0 but taking into account environmental changes
+  real recovery_time = 1 / gamma;
+  real incubation_time = 1 / a;
+  real pred_cases[n_days-1];
+  pred_cases = neg_binomial_2_rng(incidence, phi);
+  for (i in 1:n_days)
+    Reff[i] = switch_eta(i, tswitch, eta, nu, xi) * beta / gamma;
+}
+
+```
+
+### Intermediate models ordered by complexity:
+
+SIR + underreporting:
+```{stan, eval=F, output.var = "md"}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real S = y[1];
+      real I = y[2];
+      real R = y[3];
+      int N = x_i[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      
+      real dS_dt = -beta * I * S / N;
+      real dI_dt = beta * I * S / N - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dI_dt, dR_dt};
+  }
+}
+data {
+  int<lower=1> n_days;
+  real t0;
+  real y0[3];
+  real ts[n_days];
+  int N;
+  int cases[n_days];
+}
+transformed data {
+  real x_r[0];
+  int x_i[1] = { N };
+}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> phi_inv;
+  real<lower=0, upper=1> p_reported; // proportion of infected (symptomatic) people reported
+}
+transformed parameters{
+  real y[n_days, 3];
+  real incidence[n_days - 1];
+  real phi = 1. / phi_inv;
+  // initial compartement values
+  real theta[2] = {beta, gamma};
+  y = integrate_ode_rk45(sir, y0, t0, ts, theta, x_r, x_i);
+  for (i in 1:n_days-1){
+    incidence[i] =  (y[i, 1] - y[i+1, 1]) * p_reported;
+  }
+}
+model {
+  //priors
+  beta ~ normal(2, 1);
+  gamma ~ normal(0.4, 0.5);
+  phi_inv ~ exponential(5);
+  p_reported ~ beta(1, 2);
+  //sampling distribution
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
+  cases[1:(n_days-1)] ~ neg_binomial_2(incidence, phi);
+}
+generated quantities {
+  real R0 = beta / gamma;
+  real recovery_time = 1 / gamma;
+  real pred_cases[n_days-1];
+  pred_cases = neg_binomial_2_rng(incidence, phi);
+}
+
+```
+
+SEIR + varying initial infections:
+```{stan, eval=F, output.var = "md"}
+functions {
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      real N = x_i[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      real a = theta[3];
+      real i0 = theta[4];
+      real e0 = theta[5];
+      
+      real init[4] = {N - i0 - e0, e0, i0, 0}; // initial values
+      real S = y[1] + init[1];
+      real E = y[2] + init[2];
+      real I = y[3] + init[3];
+      real R = y[4] + init[4];
+      
+      real dS_dt = -beta * I * S / N;
+      real dE_dt =  beta * I * S / N - a * E;
+      real dI_dt = a * E - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dE_dt, dI_dt, dR_dt};
+  }
+}
+data {
+  int<lower=1> n_days;
+  real t0;
+  real y0[4];
+  real ts[n_days];
+  int N;
+  int cases[n_days];
+}
+transformed data {
+  real x_r[0];
+  int x_i[1] = { N };
+}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> a;
+  real<lower=0> phi_inv;
+  real<lower=0, upper=1> p_reported; // proportion of infected (symptomatic) people reported
+  real<lower=0> i0; // number of infected people inititally
+  real<lower=0> e0; // number of exposed people inititally
+}
+transformed parameters{
+  real y[n_days, 4];
+  real incidence[n_days - 1];
+  real phi = 1. / phi_inv;
+  real theta[5] = {beta, gamma, a, i0, e0};
+  y = integrate_ode_rk45(sir, rep_array(0.0, 4), t0, ts, theta, x_r, x_i);
+  for (i in 1:n_days-1){
+    incidence[i] = -(y[i+1, 2] - y[i, 2] + y[i+1, 1] - y[i, 1]) * p_reported; //-(E(t+1) - E(t) + S(t+1) - S(t))
+  }
+}
+model {
+  //priors
+  beta ~ normal(2, 1);
+  gamma ~ normal(0.4, 0.5);  
+  a ~ normal(0.4, 0.5);
+  phi_inv ~ exponential(5);
+  #p_reported ~ beta(2, 3);//normal(0, 0.5);
+  p_reported ~ beta(1, 2);
+  i0 ~ normal(0, 10);
+  e0 ~ normal(0, 10);
+  
+  //sampling distribution
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
+  cases[1:(n_days-1)] ~ neg_binomial_2(incidence, phi);
+}
+generated quantities {
+  real R0 = beta / gamma;
+  real recovery_time = 1 / gamma;
+  real incubation_time = 1 / a;
+  real pred_cases[n_days-1];
+  pred_cases = neg_binomial_2_rng(incidence, phi);
+}
+
+```
+
+SEIR + forcing function:
+```{stan, eval=F, output.var = "md"}
+functions {
+  real switch_eta(real t, real t1, real eta, real nu, real xi) {
+    return(eta + (1 - eta) / (1 + exp(xi * (t - t1 - nu))));
+  }
+  real[] sir(real t, real[] y, real[] theta, 
+             real[] x_r, int[] x_i) {
+
+      int N = x_i[1];
+      real tswitch = x_r[1];
+      
+      real beta = theta[1];
+      real gamma = theta[2];
+      real a = theta[3];
+      real eta = theta[4]; // reduction in transmission rate after quarantine
+      real nu = theta[5]; // shift of quarantine implementation
+      real xi = theta[6]; // slope of quarantine implementation
+      real i0 = theta[7];
+      real e0 = theta[8];
+      real forcing_function = switch_eta(t,tswitch,eta,nu,xi); // switch function
+      real beta_eff = beta * forcing_function; // beta decreased to take control measures into account
+      real init[4] = {N - i0 - e0, e0, i0, 0}; // initial values
+
+      real S = y[1] + init[1];
+      real E = y[2] + init[2];
+      real I = y[3] + init[3];
+      real R = y[4] + init[4];
+      
+      real dS_dt = -beta_eff * I * S / N;
+      real dE_dt =  beta_eff * I * S / N - a * E;
+      real dI_dt = a * E - gamma * I;
+      real dR_dt =  gamma * I;
+      
+      return {dS_dt, dE_dt, dI_dt, dR_dt};
+  }
+}
+data {
+  int<lower=1> n_days;
+  real t0;
+  real tswitch; // date of introduction of control measures
+  real ts[n_days];
+  int N; // population size
+  int cases[n_days];
+}
+transformed data {
+  int x_i[1] = { N };
+  real x_r[1] = {tswitch};
+}
+parameters {
+  real<lower=0> gamma;
+  real<lower=0> beta;
+  real<lower=0> a;
+  real<lower=0> phi_inv;
+  real<lower=0,upper=1> eta; // reduction in transmission due to control measures (in proportion of beta)
+  real<lower=0> nu; // shift of quarantine implementation (strictly positive as it can only occur after tswitch)
+  real<lower=0,upper=1> xi_raw; // slope of quarantine implementation (strictly positive as the logistic must be downward)
+  real<lower=0, upper=1> p_reported; // proportion of infected (symptomatic) people reported
+  real<lower=0> i0; // number of infected people inititally
+  real<lower=0> e0;
+}
+transformed parameters{
+  real y[n_days, 4];
+  real incidence[n_days - 1];
+  real phi = 1. / phi_inv;
+  real xi = xi_raw + 0.5;
+  real theta[8];
+  theta = {beta, gamma, a, eta, nu, xi, i0, e0};
+  y = integrate_ode_rk45(sir, rep_array(0.0, 4), t0, ts, theta, x_r, x_i);
+  for (i in 1:n_days-1){
+    incidence[i] = -(y[i+1, 2] - y[i, 2] + y[i+1, 1] - y[i, 1]) * p_reported; //-(E(t+1) - E(t) + S(t+1) - S(t))
+  }
+}
+model {
+  //priors
+  beta ~ normal(2, 0.5);
+  gamma ~ normal(0.4, 0.5);
+  a ~ normal(0.4, 0.5);
+  phi_inv ~ exponential(5);
+  i0 ~ normal(0, 10);
+  e0 ~ normal(0, 10);
+  p_reported ~ beta(1, 2);
+  eta ~ beta(2.5, 4);
+  nu ~ exponential(1./5);
+  xi_raw ~ beta(1, 1);
+  
+  //sampling distribution
+  //col(matrix x, int n) - The n-th column of matrix x. Here the number of infected people 
+  cases[1:(n_days-1)] ~ neg_binomial_2(incidence, phi);
+}
+generated quantities {
+  real R0 = beta / gamma;
+  real Reff[n_days];
+  real recovery_time = 1 / gamma;
+  real incubation_time = 1 / a;
+  real pred_cases[n_days-1];
+  pred_cases = neg_binomial_2_rng(incidence, phi);
+  for (i in 1:n_days)
+    Reff[i] = switch_eta(i, tswitch, eta, nu, xi) * beta / gamma;
+}
+
+```
+
