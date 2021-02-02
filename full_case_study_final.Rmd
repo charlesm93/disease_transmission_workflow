@@ -1235,6 +1235,7 @@ data_sir <- list(n_days = n_days, y0 = y0, t0 = t0, ts = t, N = N, cases = cases
 
 
 ```{r}
+#fit_sir <- readRDS("saved_fits/fit_swiss/fit_sir.RDS")
 fit_sir <- sampling(sir_model, 
                     data_sir, 
                     iter=1000,
@@ -1333,6 +1334,7 @@ model_sir_underreporting <- stan_model("stan_models/models_swiss/sir_underreport
 ```
 And fit it to the Swiss incidence data.
 ```{r}
+#fit_sir_underreporting <- readRDS("saved_fits/fit_swiss/fit_sir_underreporting.rds")
 fit_sir_underreporting <- sampling(model_sir_underreporting, 
                                    data_sir, 
                                    iter=1000,
@@ -1432,6 +1434,7 @@ We compile this new model and fit it to the data:
 ```{r}
 data_seir <- list(n_days = n_days, t0 = t0, ts = t, N = N, cases = cases)
 model_seir <- stan_model("stan_models/models_swiss/seir_indicence.stan")
+#fit_seir <- readRDS("saved_fits/fit_swiss/fit_seir.RDS")
 fit_seir <- sampling(model_seir, 
                      data_seir, 
                      iter = 1000,
@@ -1476,6 +1479,7 @@ We fit the modified model:
 
 ```{r}
 model_seir_informative <- stan_model("stan_models/models_swiss/seir_incidence_informative.stan")
+#fit_seir_informative <- readRDS("saved_fits/fit_swiss/fit_seir_informative.RDS")
 fit_seir_informative <- sampling(model_seir_informative, 
                                  data_seir, 
                                  iter=1000,
@@ -1515,6 +1519,7 @@ tswitch <- df_swiss %>% filter(date < date_switch) %>% nrow() + 1 # convert time
 
 data_forcing <- list(n_days = n_days, t0 = t0, ts = t, N = N, cases = cases, tswitch = tswitch)
 model_forcing <- stan_model("stan_models/models_swiss/seir_forcing.stan")
+#fit_forcing <- readRDS("saved_fits/fit_swiss/fit_forcing.RDS")
 fit_forcing <- sampling(model_forcing, 
                         data_forcing, 
                         iter=1000,
@@ -1566,13 +1571,14 @@ n_infected_survey ~ binomial(n_tested_survey, p_infected_survey);
 We compile the model and launch the sampler:
 ```{r}
 model_forcing_survey <- stan_model("stan_models/models_swiss/seir_forcing_survey.stan")
+#fit_forcing_survey = readRDS("saved_fits/fit_swiss/fit_forcing_survey.rds")
 fit_forcing_survey <- sampling(model_forcing_survey, 
                                data_forcing_survey, 
                                iter=1000,
                                seed=0)
 ```
 
-Stan diagnostics are green, except for the fact that the maximum tree depth is often exceeded. This means that Stan had to choose a step size small enough to explore some part of the posterior, but that this step size is too small for exploring another part of the posterior efficiently, slowing down the sampling process. This is not too worrying, given that the other diagnostics are good. Still, we can look at the pairs plot. Yellow points indicate maximum tree depth saturation, and red points indicate divergences (which mean the step size is too big).
+Stan diagnostics are green, except for the fact that the maximum tree depth is often exceeded (and a few divergences). This means that Stan had to choose a step size small enough to explore some part of the posterior, but that this step size is too small for exploring another part of the posterior efficiently, slowing down the sampling process. This is not too worrying, given that the other diagnostics are good. Still, we can look at the pairs plot. Yellow points indicate maximum tree depth saturation, and red points indicate divergences (which mean the step size is too big).
 
 ```{r}
 pairs(fit_forcing_survey, pars = c("beta", "gamma", "a", "p_reported", "nu", "xi", "eta"))
@@ -1581,6 +1587,7 @@ pairs(fit_forcing_survey, pars = c("beta", "gamma", "a", "p_reported", "nu", "xi
 The posterior may not be easy to explore, for instance due to the close dependency between `a` and `eta` but nothing seems particularly worrying. We can increase the maximum tree depth and try again.
 
 ```{r}
+#fit_forcing_survey_max = readRDS("saved_fits/fit_swiss/fit_forcing_survey_max.rds")
 fit_forcing_survey_max <- sampling(model_forcing_survey, 
                                    data_forcing_survey,  
                                    control = list(max_treedepth = 13, adapt_delta=0.9), 
